@@ -610,11 +610,6 @@ def render_formula_boundary_mask(width, height, selected_segments, settings):
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (draw_width, draw_width))
         mask = cv2.dilate(mask, kernel, iterations=1)
 
-    # The image border is a valid boundary for flood-filled zones.
-    mask[0, :] = 255
-    mask[-1, :] = 255
-    mask[:, 0] = 255
-    mask[:, -1] = 255
     return mask
 
 
@@ -646,6 +641,15 @@ def color_zones_from_boundary(boundary_mask, img_rgb, settings):
     line_color = 255 if settings.invert_lines else 0
     filled[boundary_mask > 0] = line_color
     return Image.fromarray(filled).convert("RGB"), zone_data
+
+
+def overlay_boundary_on_image(base_image, boundary_mask, settings):
+    base = base_image.copy().convert("RGB")
+    line_color = (255, 255, 255) if settings.invert_lines else (0, 0, 0)
+    overlay = Image.new("RGB", base.size, line_color)
+    mask = Image.fromarray(boundary_mask).convert("L")
+    base.paste(overlay, mask=mask)
+    return base
 
 
 def build_segments_from_contours(contour_entries, settings):
@@ -832,11 +836,13 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
 
     report_progress(callback, start_time, 84, "Rendering preview...", "Rendering final contour image...")
     zone_data = []
+    formula_boundary = render_formula_boundary_mask(w, h, selected_segments, settings)
     if settings.fill_zones:
-        boundary = prepare_fill_boundary_mask(edges, settings)
-        result_image, zone_data = color_zones_from_boundary(boundary, processed_rgb, settings)
+        boundary = prepare_fill_boundary_mask(formula_boundary, settings)
+        filled_image, zone_data = color_zones_from_boundary(boundary, processed_rgb, settings)
+        result_image = overlay_boundary_on_image(filled_image, formula_boundary, settings)
     else:
-        result_image = render_edge_line_image(edges, processed_rgb, settings)
+        result_image = render_edge_line_image(formula_boundary, processed_rgb, settings)
     edge_image = make_preview_from_array(edges)
     gray_image = make_preview_from_array(gray)
     processed_image = Image.fromarray(processed_rgb).convert("RGB")
