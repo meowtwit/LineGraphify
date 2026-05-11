@@ -34,6 +34,8 @@ class ProcessSettings:
     max_total_formulas: int = 450
     samples_per_segment: int = 18
     line_width: int = 2
+    fill_close_kernel: int = 5
+    fill_boundary_width: int = 4
     invert_lines: bool = False
     overlay: bool = False
     fill_zones: bool = False
@@ -573,6 +575,24 @@ def thicken_boundary_mask(edges, line_width):
     return line_mask
 
 
+def prepare_fill_boundary_mask(edges, settings):
+    boundary = edges.copy()
+
+    close_kernel = normalize_odd_kernel(settings.fill_close_kernel)
+    if close_kernel > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
+        boundary = cv2.morphologyEx(boundary, cv2.MORPH_CLOSE, kernel)
+
+    boundary = thicken_boundary_mask(boundary, settings.fill_boundary_width)
+
+    # Prevent the outside of the image from leaking into interior regions.
+    boundary[0, :] = 255
+    boundary[-1, :] = 255
+    boundary[:, 0] = 255
+    boundary[:, -1] = 255
+    return boundary
+
+
 def render_formula_boundary_mask(width, height, selected_segments, settings):
     mask_img = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(mask_img)
@@ -813,7 +833,7 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
     report_progress(callback, start_time, 84, "Rendering preview...", "Rendering final contour image...")
     zone_data = []
     if settings.fill_zones:
-        boundary = thicken_boundary_mask(edges, settings.line_width)
+        boundary = prepare_fill_boundary_mask(edges, settings)
         result_image, zone_data = color_zones_from_boundary(boundary, processed_rgb, settings)
     else:
         result_image = render_edge_line_image(edges, processed_rgb, settings)
@@ -897,6 +917,8 @@ class ContourGraphArtApp(tk.Tk):
         self.max_total_formulas_var = tk.IntVar(value=450)
         self.samples_per_segment_var = tk.IntVar(value=18)
         self.line_width_var = tk.IntVar(value=2)
+        self.fill_close_kernel_var = tk.IntVar(value=5)
+        self.fill_boundary_width_var = tk.IntVar(value=4)
         self.x_half_range_var = tk.DoubleVar(value=10.0)
         self.invert_lines_var = tk.BooleanVar(value=False)
         self.overlay_var = tk.BooleanVar(value=False)
@@ -915,6 +937,8 @@ class ContourGraphArtApp(tk.Tk):
             ("Max total formulas", self.max_total_formulas_var),
             ("Samples / segment", self.samples_per_segment_var),
             ("Line width", self.line_width_var),
+            ("Fill close kernel", self.fill_close_kernel_var),
+            ("Fill boundary width", self.fill_boundary_width_var),
             ("Math x half-range", self.x_half_range_var),
         ]
 
@@ -927,16 +951,16 @@ class ContourGraphArtApp(tk.Tk):
             )
 
         ttk.Checkbutton(settings, text="Invert lines", variable=self.invert_lines_var).grid(
-            row=3, column=0, sticky="w", padx=4, pady=4
+            row=4, column=0, sticky="w", padx=4, pady=4
         )
         ttk.Checkbutton(settings, text="Overlay on original", variable=self.overlay_var).grid(
-            row=3, column=2, sticky="w", padx=4, pady=4
+            row=4, column=2, sticky="w", padx=4, pady=4
         )
         ttk.Checkbutton(settings, text="Major contours only", variable=self.major_only_var).grid(
-            row=3, column=4, sticky="w", padx=4, pady=4
+            row=4, column=4, sticky="w", padx=4, pady=4
         )
         ttk.Checkbutton(settings, text="Fill zones", variable=self.fill_zones_var).grid(
-            row=3, column=6, sticky="w", padx=4, pady=4
+            row=4, column=6, sticky="w", padx=4, pady=4
         )
 
     def _build_previews(self):
@@ -1042,6 +1066,8 @@ class ContourGraphArtApp(tk.Tk):
             max_total_formulas=int(self.max_total_formulas_var.get()),
             samples_per_segment=int(self.samples_per_segment_var.get()),
             line_width=int(self.line_width_var.get()),
+            fill_close_kernel=int(self.fill_close_kernel_var.get()),
+            fill_boundary_width=int(self.fill_boundary_width_var.get()),
             invert_lines=bool(self.invert_lines_var.get()),
             overlay=bool(self.overlay_var.get()),
             fill_zones=bool(self.fill_zones_var.get()),
@@ -1060,6 +1086,10 @@ class ContourGraphArtApp(tk.Tk):
             raise ValueError("Samples per segment must be at least 2.")
         if settings.line_width <= 0:
             raise ValueError("Line width must be positive.")
+        if settings.fill_close_kernel < 0:
+            raise ValueError("Fill close kernel must be zero or positive.")
+        if settings.fill_boundary_width <= 0:
+            raise ValueError("Fill boundary width must be positive.")
         if settings.x_half_range <= 0:
             raise ValueError("Math x half-range must be positive.")
         return settings
