@@ -2,6 +2,7 @@ import json
 import math
 import os
 import queue
+import csv
 import threading
 import time
 import tkinter as tk
@@ -11,6 +12,17 @@ from tkinter.scrolledtext import ScrolledText
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
+
+
+EXPORT_FORMATS = {
+    "auto": "自動",
+    "json": "JSON（完全・大きめ）",
+    "jsonl": "JSONL（大量向け）",
+    "csv": "CSV（軽量）",
+    "txt": "TXT（人間用）",
+}
+
+EXPORT_FORMAT_BY_LABEL = {label: key for key, label in EXPORT_FORMATS.items()}
 
 try:
     import cv2
@@ -806,35 +818,188 @@ def build_formula_text(project_meta, formula_data):
     return "\n".join(lines)
 
 
+def count_formula_segments(formula_data):
+    return sum(len(contour.get("segments", [])) for contour in formula_data or [])
+
+
+def choose_export_format(format_key, formula_count):
+    if format_key != "auto":
+        return format_key
+    if formula_count <= 10000:
+        return "json"
+    if formula_count <= 200000:
+        return "jsonl"
+    return "csv"
+
+
+def format_bytes(size):
+    size = max(0, float(size))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit = 0
+    while size >= 1024.0 and unit < len(units) - 1:
+        size /= 1024.0
+        unit += 1
+    if unit == 0:
+        return f"{int(size)} {units[unit]}"
+    return f"{size:.1f} {units[unit]}"
+
+
+def estimate_export_size(project_meta, formula_data, zone_data, format_key):
+    formula_count = count_formula_segments(formula_data)
+    zone_count = len(zone_data or [])
+    actual_format = choose_export_format(format_key, formula_count)
+
+    # Conservative estimates. Pretty JSON includes sampled points and repeated keys,
+    # so it is intentionally much larger than JSONL/CSV.
+    per_segment = {
+        "json": 900,
+        "jsonl": 260,
+        "csv": 150,
+        "txt": 230,
+    }.get(actual_format, 260)
+    base = {
+        "json": 12000,
+        "jsonl": 4000,
+        "csv": 600,
+        "txt": 3000,
+    }.get(actual_format, 1000)
+    per_zone = {
+        "json": 120,
+        "jsonl": 120,
+        "csv": 0,
+        "txt": 0,
+    }.get(actual_format, 0)
+
+    return int(base + formula_count * per_segment + zone_count * per_zone), actual_format
+
+
+def csv_cell(value):
+    return "" if value is None else value
+
+
+def write_formula_json(path, project_meta, formula_data, zone_data):
+    obj = {
+        "project_meta": project_meta,
+        "formula_data": formula_data,
+        "zone_data": zone_data or [],
+    }
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(obj, file, ensure_ascii=False, indent=2)
+
+
+def write_formula_jsonl(path, project_meta, formula_data, zone_data):
+    with open(path, "w", encoding="utf-8") as file:
+        file.write(json.dumps({"type": "project_meta", "data": project_meta}, ensure_ascii=False) + "\n")
+        for zone in zone_data or []:
+            file.write(json.dumps({"type": "zone", "data": zone}, ensure_ascii=False) + "\n")
+        for contour in formula_data or []:
+            common = {
+                "contour_index": contour.get("contour_index"),
+                "source_length_px": contour.get("source_length_px"),
+                "source_area_px": contour.get("source_area_px"),
+            }
+            for segment in contour.get("segments", []):
+                row = dict(common)
+                row.update({
+                    "segment_index": segment.get("segment_index"),
+                    "x_coefficients": segment.get("x_coefficients"),
+                    "y_coefficients": segment.get("y_coefficients"),
+                    "domain": segment.get("domain"),
+                })
+                file.write(json.dumps({"type": "segment", "data": row}, ensure_ascii=False) + "\n")
+
+
+def write_formula_csv(path, formula_data):
+    with open(path, "w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "contour_index",
+            "segment_index",
+            "x_a",
+            "x_b",
+            "x_c",
+            "x_d",
+            "y_a",
+            "y_b",
+            "y_c",
+            "y_d",
+            "source_length_px",
+            "source_area_px",
+            "domain",
+        ])
+        for contour in formula_data or []:
+            contour_index = contour.get("contour_index")
+            length = contour.get("source_length_px")
+            area = contour.get("source_area_px")
+            for segment in contour.get("segments", []):
+                x_coeffs = segment.get("x_coefficients") or ["", "", "", ""]
+                y_coeffs = segment.get("y_coefficients") or ["", "", "", ""]
+                writer.writerow([
+                    contour_index,
+                    segment.get("segment_index"),
+                    *x_coeffs,
+                    *y_coeffs,
+                    length,
+                    area,
+                    segment.get("domain"),
+                ])
+
+
+def default_extension_for_format(format_key):
+    return {
+        "json": ".json",
+        "jsonl": ".jsonl",
+        "csv": ".csv",
+        "txt": ".txt",
+    }.get(format_key, ".json")
+
+
+def filetypes_for_format(format_key):
+    if format_key == "json":
+        return [("JSONファイル", "*.json")]
+    if format_key == "jsonl":
+        return [("JSON Linesファイル", "*.jsonl")]
+    if format_key == "csv":
+        return [("CSVファイル", "*.csv")]
+    if format_key == "txt":
+        return [("テキストファイル", "*.txt")]
+    return [
+        ("JSONファイル", "*.json"),
+        ("JSON Linesファイル", "*.jsonl"),
+        ("CSVファイル", "*.csv"),
+        ("テキストファイル", "*.txt"),
+    ]
+
+
 def process_image_to_formulas(img_rgb, image_path, settings, callback):
     start_time = time.time()
-    report_progress(callback, start_time, 3, "Loading image...", "Loading image...")
+    report_progress(callback, start_time, 3, "画像を読み込み中...", "画像を読み込み中...")
 
     processed_rgb, scale = resize_to_max_side(img_rgb, settings.max_image_size)
     h, w = processed_rgb.shape[:2]
 
-    report_progress(callback, start_time, 13, "Preprocessing...", "Preprocessing image...")
+    report_progress(callback, start_time, 13, "前処理中...", "画像を前処理中...")
     gray, edges = preprocess_edges(processed_rgb, settings)
 
-    report_progress(callback, start_time, 30, "Extracting contours...", "Detecting edge contours...")
+    report_progress(callback, start_time, 30, "輪郭抽出中...", "エッジ輪郭を検出中...")
     contour_entries = extract_contour_entries(edges, settings)
     if not contour_entries:
-        raise ValueError("No contours found. Lower Canny thresholds or min contour filters.")
+        raise ValueError("輪郭が見つかりません。Cannyしきい値や最小輪郭フィルタを下げてください。")
 
     callback({"type": "contours", "rows": contour_entries[:300], "total": len(contour_entries)})
     report_progress(
         callback,
         start_time,
         45,
-        "Allocating formula budget...",
-        f"Found {len(contour_entries)} usable contours.",
+        "式数を配分中...",
+        f"使用可能な輪郭を {len(contour_entries)} 件検出しました。",
     )
 
-    report_progress(callback, start_time, 62, "Fitting curves...")
+    report_progress(callback, start_time, 62, "曲線近似中...")
     selected_segments = build_segments_from_contours(contour_entries, settings)
-    report_progress(callback, start_time, 80, "Fitting curves...")
+    report_progress(callback, start_time, 80, "曲線近似中...")
 
-    report_progress(callback, start_time, 84, "Rendering preview...", "Rendering final contour image...")
+    report_progress(callback, start_time, 84, "プレビュー描画中...", "最終輪郭画像を描画中...")
     zone_data = []
     formula_boundary = render_formula_boundary_mask(w, h, selected_segments, settings)
     if settings.fill_zones:
@@ -847,7 +1012,7 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
     gray_image = make_preview_from_array(gray)
     processed_image = Image.fromarray(processed_rgb).convert("RGB")
 
-    report_progress(callback, start_time, 93, "Building formula export...", "Building TXT/JSON formula data...")
+    report_progress(callback, start_time, 93, "数式データ作成中...", "TXT/JSON用の数式データを作成中...")
     project_meta, formula_data = build_formula_exports(
         selected_segments,
         w,
@@ -858,7 +1023,7 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
         zone_data,
     )
 
-    report_progress(callback, start_time, 100, "Export ready", "Export ready.")
+    report_progress(callback, start_time, 100, "書き出し準備完了", "書き出し準備完了。")
     return {
         "processed_image": processed_image,
         "gray_image": gray_image,
@@ -873,7 +1038,7 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
 class ContourGraphArtApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Contour Graph Art Formula Generator")
+        self.title("LineGraphify - 輪郭線グラフアート生成")
         self.geometry("1480x980")
         self.minsize(1220, 820)
 
@@ -896,12 +1061,12 @@ class ContourGraphArtApp(tk.Tk):
         self.run_button.pack(side=tk.LEFT, padx=4)
         self.save_png_button = ttk.Button(top, text="PNG保存", command=self.save_png, state=tk.DISABLED)
         self.save_png_button.pack(side=tk.LEFT, padx=4)
-        self.save_txt_button = ttk.Button(top, text="数式TXT保存", command=self.save_txt, state=tk.DISABLED)
+        self.save_txt_button = ttk.Button(top, text="説明TXT保存", command=self.save_txt, state=tk.DISABLED)
         self.save_txt_button.pack(side=tk.LEFT, padx=4)
-        self.save_json_button = ttk.Button(top, text="数式JSON保存", command=self.save_json, state=tk.DISABLED)
+        self.save_json_button = ttk.Button(top, text="数式データ保存", command=self.save_formula_data, state=tk.DISABLED)
         self.save_json_button.pack(side=tk.LEFT, padx=4)
 
-        self.file_label = ttk.Label(top, text="No image loaded")
+        self.file_label = ttk.Label(top, text="画像未読み込み")
         self.file_label.pack(side=tk.LEFT, padx=12)
 
         self._build_settings()
@@ -909,7 +1074,7 @@ class ContourGraphArtApp(tk.Tk):
         self._build_progress_and_logs()
 
     def _build_settings(self):
-        settings = ttk.LabelFrame(self, text="Parameters", padding=8)
+        settings = ttk.LabelFrame(self, text="処理パラメータ", padding=8)
         settings.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
 
         self.max_image_size_var = tk.IntVar(value=800)
@@ -930,22 +1095,25 @@ class ContourGraphArtApp(tk.Tk):
         self.overlay_var = tk.BooleanVar(value=False)
         self.fill_zones_var = tk.BooleanVar(value=False)
         self.major_only_var = tk.BooleanVar(value=False)
+        self.export_format_var = tk.StringVar(value=EXPORT_FORMATS["auto"])
+        self.auto_delete_temp_var = tk.BooleanVar(value=True)
+        self.size_estimate_var = tk.StringVar(value="予想サイズ: 未生成")
 
         fields = [
-            ("Max image size", self.max_image_size_var),
-            ("Blur amount", self.blur_amount_var),
-            ("Canny lower", self.canny_lower_var),
-            ("Canny upper", self.canny_upper_var),
-            ("Morphology kernel", self.morphology_kernel_var),
-            ("Min contour length", self.min_contour_length_var),
-            ("Min contour area", self.min_contour_area_var),
-            ("Approx epsilon %", self.approx_epsilon_var),
-            ("Max total formulas", self.max_total_formulas_var),
-            ("Samples / segment", self.samples_per_segment_var),
-            ("Line width", self.line_width_var),
-            ("Fill close kernel", self.fill_close_kernel_var),
-            ("Fill boundary width", self.fill_boundary_width_var),
-            ("Math x half-range", self.x_half_range_var),
+            ("画像最大辺", self.max_image_size_var),
+            ("ぼかし量", self.blur_amount_var),
+            ("Canny下限", self.canny_lower_var),
+            ("Canny上限", self.canny_upper_var),
+            ("形態処理カーネル", self.morphology_kernel_var),
+            ("最小輪郭長", self.min_contour_length_var),
+            ("最小輪郭面積", self.min_contour_area_var),
+            ("近似強度 %", self.approx_epsilon_var),
+            ("最大式数", self.max_total_formulas_var),
+            ("区間サンプル数", self.samples_per_segment_var),
+            ("線幅", self.line_width_var),
+            ("塗り隙間閉じ", self.fill_close_kernel_var),
+            ("塗り境界幅", self.fill_boundary_width_var),
+            ("数学x半幅", self.x_half_range_var),
         ]
 
         for index, (label, variable) in enumerate(fields):
@@ -956,17 +1124,39 @@ class ContourGraphArtApp(tk.Tk):
                 row=row, column=col + 1, sticky="w", padx=4, pady=4
             )
 
-        ttk.Checkbutton(settings, text="Invert lines", variable=self.invert_lines_var).grid(
+        ttk.Checkbutton(settings, text="白黒反転", variable=self.invert_lines_var).grid(
             row=4, column=0, sticky="w", padx=4, pady=4
         )
-        ttk.Checkbutton(settings, text="Overlay on original", variable=self.overlay_var).grid(
+        ttk.Checkbutton(settings, text="元画像に重ねる", variable=self.overlay_var).grid(
             row=4, column=2, sticky="w", padx=4, pady=4
         )
-        ttk.Checkbutton(settings, text="Major contours only", variable=self.major_only_var).grid(
+        ttk.Checkbutton(settings, text="主要輪郭のみ", variable=self.major_only_var).grid(
             row=4, column=4, sticky="w", padx=4, pady=4
         )
-        ttk.Checkbutton(settings, text="Fill zones", variable=self.fill_zones_var).grid(
+        ttk.Checkbutton(settings, text="領域を塗る", variable=self.fill_zones_var).grid(
             row=4, column=6, sticky="w", padx=4, pady=4
+        )
+
+        export_frame = ttk.LabelFrame(self, text="保存設定", padding=8)
+        export_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Label(export_frame, text="数式データ形式").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.export_format_combo = ttk.Combobox(
+            export_frame,
+            textvariable=self.export_format_var,
+            values=list(EXPORT_FORMATS.values()),
+            state="readonly",
+            width=22,
+        )
+        self.export_format_combo.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        self.export_format_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_size_estimate())
+        ttk.Checkbutton(
+            export_frame,
+            text="一時ファイルを使用後に自動削除",
+            variable=self.auto_delete_temp_var,
+            command=self.update_size_estimate,
+        ).grid(row=0, column=2, sticky="w", padx=12, pady=4)
+        ttk.Label(export_frame, textvariable=self.size_estimate_var).grid(
+            row=0, column=3, sticky="w", padx=12, pady=4
         )
 
     def _build_previews(self):
@@ -982,17 +1172,17 @@ class ContourGraphArtApp(tk.Tk):
         ]:
             frame = ttk.LabelFrame(previews, text=title, padding=8)
             frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
-            label = ttk.Label(frame, text="No image", anchor="center")
+            label = ttk.Label(frame, text="画像なし", anchor="center")
             label.pack(fill=tk.BOTH, expand=True)
             self.preview_labels[key] = label
 
     def _build_progress_and_logs(self):
-        progress_frame = ttk.LabelFrame(self, text="Progress", padding=8)
+        progress_frame = ttk.LabelFrame(self, text="進捗", padding=8)
         progress_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
 
-        self.status_var = tk.StringVar(value="Idle")
+        self.status_var = tk.StringVar(value="待機中")
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.eta_var = tk.StringVar(value="ETA: --:--:--")
+        self.eta_var = tk.StringVar(value="残り時間: --:--:--")
         ttk.Label(progress_frame, textvariable=self.status_var).pack(anchor="w")
         ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).pack(fill=tk.X, pady=6)
         ttk.Label(progress_frame, textvariable=self.eta_var).pack(anchor="w")
@@ -1000,26 +1190,26 @@ class ContourGraphArtApp(tk.Tk):
         bottom = ttk.Frame(self, padding=(8, 0, 8, 8))
         bottom.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        contours_box = ttk.LabelFrame(bottom, text="Contour Allocation", padding=8)
+        contours_box = ttk.LabelFrame(bottom, text="輪郭情報", padding=8)
         contours_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
 
         columns = ("rank", "length", "area", "max_segments")
         self.tree = ttk.Treeview(contours_box, columns=columns, show="headings", height=13)
         for column, heading, width in [
-            ("rank", "Rank", 60),
-            ("length", "Length", 110),
-            ("area", "Area", 110),
-            ("max_segments", "Max Segments", 120),
+            ("rank", "順位", 60),
+            ("length", "長さ", 110),
+            ("area", "面積", 110),
+            ("max_segments", "最大区間", 120),
         ]:
             self.tree.heading(column, text=heading)
             self.tree.column(column, width=width, anchor="e")
         self.tree.pack(fill=tk.BOTH, expand=True)
 
-        log_box = ttk.LabelFrame(bottom, text="Log", padding=8)
+        log_box = ttk.LabelFrame(bottom, text="ログ", padding=8)
         log_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
         self.log_text = ScrolledText(log_box, wrap=tk.WORD, height=13)
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_text.insert(tk.END, "Ready.\n")
+        self.log_text.insert(tk.END, "準備完了。\n")
         self.log_text.configure(state=tk.DISABLED)
 
     def log(self, text):
@@ -1030,10 +1220,10 @@ class ContourGraphArtApp(tk.Tk):
 
     def load_image(self):
         path = filedialog.askopenfilename(
-            title="Select image",
+            title="画像を選択",
             filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
-                ("All files", "*.*"),
+                ("画像ファイル", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                ("すべてのファイル", "*.*"),
             ],
         )
         if not path:
@@ -1048,16 +1238,17 @@ class ContourGraphArtApp(tk.Tk):
             self.file_label.configure(text=os.path.basename(path))
             self._set_preview("original", img)
             for key in ("processed", "edges", "result"):
-                self.preview_labels[key].configure(image="", text="No image")
+                self.preview_labels[key].configure(image="", text="画像なし")
                 self.preview_labels[key].image = None
             self._set_save_state(tk.DISABLED)
+            self.update_size_estimate()
             self._clear_tree()
             self.progress_var.set(0)
-            self.status_var.set("Image loaded")
-            self.eta_var.set("ETA: --:--:--")
-            self.log(f"Loaded image: {path}")
+            self.status_var.set("画像読み込み完了")
+            self.eta_var.set("残り時間: --:--:--")
+            self.log(f"画像を読み込みました: {path}")
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to load image.\n\n{exc}")
+            messagebox.showerror("エラー", f"画像の読み込みに失敗しました。\n\n{exc}")
 
     def _read_settings(self):
         settings = ProcessSettings(
@@ -1081,46 +1272,46 @@ class ContourGraphArtApp(tk.Tk):
             x_half_range=float(self.x_half_range_var.get()),
         )
         if settings.max_image_size < 64:
-            raise ValueError("Max image size must be at least 64.")
+            raise ValueError("画像最大辺は64以上にしてください。")
         if settings.canny_lower < 0 or settings.canny_upper <= settings.canny_lower:
-            raise ValueError("Canny upper must be greater than Canny lower.")
+            raise ValueError("Canny上限はCanny下限より大きくしてください。")
         if settings.max_total_formulas <= 0:
-            raise ValueError("Max total formulas must be positive.")
+            raise ValueError("最大式数は1以上にしてください。")
         if settings.max_total_formulas > 10000:
-            raise ValueError("Max total formulas is capped at 10000.")
+            raise ValueError("Python GUI版の最大式数は10000までです。10万以上はC++連携版で扱います。")
         if settings.samples_per_segment < 2:
-            raise ValueError("Samples per segment must be at least 2.")
+            raise ValueError("区間サンプル数は2以上にしてください。")
         if settings.line_width <= 0:
-            raise ValueError("Line width must be positive.")
+            raise ValueError("線幅は1以上にしてください。")
         if settings.fill_close_kernel < 0:
-            raise ValueError("Fill close kernel must be zero or positive.")
+            raise ValueError("塗り隙間閉じは0以上にしてください。")
         if settings.fill_boundary_width <= 0:
-            raise ValueError("Fill boundary width must be positive.")
+            raise ValueError("塗り境界幅は1以上にしてください。")
         if settings.x_half_range <= 0:
-            raise ValueError("Math x half-range must be positive.")
+            raise ValueError("数学x半幅は正の値にしてください。")
         return settings
 
     def start_processing(self):
         if self.original_image_np is None:
-            messagebox.showwarning("Warning", "Load an image first.")
+            messagebox.showwarning("警告", "先に画像を読み込んでください。")
             return
         if self.processing_thread is not None and self.processing_thread.is_alive():
-            messagebox.showinfo("Info", "Processing is already running.")
+            messagebox.showinfo("情報", "すでに処理中です。")
             return
 
         try:
             settings = self._read_settings()
         except Exception as exc:
-            messagebox.showerror("Error", f"Invalid parameters.\n\n{exc}")
+            messagebox.showerror("エラー", f"パラメータが不正です。\n\n{exc}")
             return
 
         self.run_button.configure(state=tk.DISABLED)
         self._set_save_state(tk.DISABLED)
         self._clear_tree()
         self.progress_var.set(0.0)
-        self.status_var.set("Starting...")
-        self.eta_var.set("ETA: --:--:--")
-        self.log("Starting contour-based processing.")
+        self.status_var.set("開始中...")
+        self.eta_var.set("残り時間: --:--:--")
+        self.log("輪郭線ベースの処理を開始します。")
 
         self.processing_thread = threading.Thread(
             target=self._worker_process,
@@ -1152,7 +1343,7 @@ class ContourGraphArtApp(tk.Tk):
                 elif msg_type == "progress":
                     self.progress_var.set(msg["value"])
                     self.status_var.set(msg["status"])
-                    self.eta_var.set(f"ETA: {format_seconds(msg['eta'])}")
+                    self.eta_var.set(f"残り時間: {format_seconds(msg['eta'])}")
                 elif msg_type == "contours":
                     self._populate_contours(msg["rows"], msg["total"])
                 elif msg_type == "finished":
@@ -1161,17 +1352,18 @@ class ContourGraphArtApp(tk.Tk):
                     self._set_preview("edges", self.outputs["edge_image"])
                     self._set_preview("result", self.outputs["result_image"])
                     self.progress_var.set(100.0)
-                    self.status_var.set("Export ready")
-                    self.eta_var.set("ETA: 00:00:00")
+                    self.status_var.set("書き出し準備完了")
+                    self.eta_var.set("残り時間: 00:00:00")
                     self.run_button.configure(state=tk.NORMAL)
                     self._set_save_state(tk.NORMAL)
+                    self.update_size_estimate()
                     total = self.outputs["project_meta"]["total_formula_count"]
-                    self.log(f"Completed. Total formulas: {total}")
+                    self.log(f"完了しました。総式数: {total}")
                 elif msg_type == "error":
                     self.run_button.configure(state=tk.NORMAL)
-                    self.status_var.set("Error")
-                    self.log("ERROR: " + msg["text"])
-                    messagebox.showerror("Processing Error", msg["text"])
+                    self.status_var.set("エラー")
+                    self.log("エラー: " + msg["text"])
+                    messagebox.showerror("処理エラー", msg["text"])
         except queue.Empty:
             pass
 
@@ -1186,6 +1378,26 @@ class ContourGraphArtApp(tk.Tk):
         self.save_png_button.configure(state=state)
         self.save_txt_button.configure(state=state)
         self.save_json_button.configure(state=state)
+
+    def _selected_export_format(self):
+        return EXPORT_FORMAT_BY_LABEL.get(self.export_format_var.get(), "auto")
+
+    def update_size_estimate(self):
+        if not self.outputs:
+            self.size_estimate_var.set("予想サイズ: 未生成")
+            return
+
+        format_key = self._selected_export_format()
+        estimated, actual_format = estimate_export_size(
+            self.outputs["project_meta"],
+            self.outputs["formula_data"],
+            self.outputs.get("zone_data", []),
+            format_key,
+        )
+        cleanup = "一時ファイル削除: ON" if self.auto_delete_temp_var.get() else "一時ファイル削除: OFF"
+        self.size_estimate_var.set(
+            f"予想サイズ: 約 {format_bytes(estimated)} / 実形式: {EXPORT_FORMATS[actual_format]} / {cleanup}"
+        )
 
     def _clear_tree(self):
         for item in self.tree.get_children():
@@ -1204,33 +1416,33 @@ class ContourGraphArtApp(tk.Tk):
                     entry["max_segments"],
                 ),
             )
-        self.log(f"Showing top {len(rows)} of {total} usable contours.")
+        self.log(f"使用可能な輪郭 {total} 件中、上位 {len(rows)} 件を表示しています。")
 
     def save_png(self):
         if not self.outputs:
-            messagebox.showwarning("Warning", "No result to save.")
+            messagebox.showwarning("警告", "保存する結果がありません。")
             return
         path = filedialog.asksaveasfilename(
-            title="Save PNG",
+            title="PNGを保存",
             defaultextension=".png",
-            filetypes=[("PNG files", "*.png")],
+            filetypes=[("PNGファイル", "*.png")],
         )
         if not path:
             return
         try:
             self.outputs["result_image"].save(path)
-            self.log(f"Saved PNG: {path}")
+            self.log(f"PNGを保存しました: {path}")
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to save PNG.\n\n{exc}")
+            messagebox.showerror("エラー", f"PNG保存に失敗しました。\n\n{exc}")
 
     def save_txt(self):
         if not self.outputs:
-            messagebox.showwarning("Warning", "No formula data to save.")
+            messagebox.showwarning("警告", "保存する数式データがありません。")
             return
         path = filedialog.asksaveasfilename(
-            title="Save TXT",
+            title="説明TXTを保存",
             defaultextension=".txt",
-            filetypes=[("Text files", "*.txt")],
+            filetypes=[("テキストファイル", "*.txt")],
         )
         if not path:
             return
@@ -1238,32 +1450,62 @@ class ContourGraphArtApp(tk.Tk):
             text = build_formula_text(self.outputs["project_meta"], self.outputs["formula_data"])
             with open(path, "w", encoding="utf-8") as file:
                 file.write(text)
-            self.log(f"Saved TXT: {path}")
+            self.log(f"説明TXTを保存しました: {path}")
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to save TXT.\n\n{exc}")
+            messagebox.showerror("エラー", f"TXT保存に失敗しました。\n\n{exc}")
 
-    def save_json(self):
+    def save_formula_data(self):
         if not self.outputs:
-            messagebox.showwarning("Warning", "No formula data to save.")
+            messagebox.showwarning("警告", "保存する数式データがありません。")
             return
+        requested_format = self._selected_export_format()
+        actual_format = choose_export_format(
+            requested_format,
+            self.outputs["project_meta"]["total_formula_count"],
+        )
         path = filedialog.asksaveasfilename(
-            title="Save JSON",
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json")],
+            title="数式データを保存",
+            defaultextension=default_extension_for_format(actual_format),
+            filetypes=filetypes_for_format(actual_format),
         )
         if not path:
             return
         try:
-            obj = {
-                "project_meta": self.outputs["project_meta"],
-                "formula_data": self.outputs["formula_data"],
-                "zone_data": self.outputs.get("zone_data", []),
-            }
-            with open(path, "w", encoding="utf-8") as file:
-                json.dump(obj, file, ensure_ascii=False, indent=2)
-            self.log(f"Saved JSON: {path}")
+            if actual_format == "json":
+                write_formula_json(
+                    path,
+                    self.outputs["project_meta"],
+                    self.outputs["formula_data"],
+                    self.outputs.get("zone_data", []),
+                )
+            elif actual_format == "jsonl":
+                write_formula_jsonl(
+                    path,
+                    self.outputs["project_meta"],
+                    self.outputs["formula_data"],
+                    self.outputs.get("zone_data", []),
+                )
+            elif actual_format == "csv":
+                write_formula_csv(path, self.outputs["formula_data"])
+            elif actual_format == "txt":
+                text = build_formula_text(self.outputs["project_meta"], self.outputs["formula_data"])
+                with open(path, "w", encoding="utf-8") as file:
+                    file.write(text)
+            else:
+                raise ValueError(f"未対応の保存形式です: {actual_format}")
+
+            estimated, _ = estimate_export_size(
+                self.outputs["project_meta"],
+                self.outputs["formula_data"],
+                self.outputs.get("zone_data", []),
+                actual_format,
+            )
+            self.log(
+                f"数式データを保存しました: {path} "
+                f"({EXPORT_FORMATS.get(actual_format, actual_format)}, 予想 {format_bytes(estimated)})"
+            )
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to save JSON.\n\n{exc}")
+            messagebox.showerror("エラー", f"数式データ保存に失敗しました。\n\n{exc}")
 
 
 if __name__ == "__main__":
