@@ -3,9 +3,13 @@ import math
 import os
 import queue
 import csv
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -52,6 +56,7 @@ class ProcessSettings:
     overlay: bool = False
     fill_zones: bool = False
     major_only: bool = False
+    use_cpp_generator: bool = False
     x_half_range: float = 10.0
 
 
@@ -845,7 +850,10 @@ def format_bytes(size):
 
 
 def estimate_export_size(project_meta, formula_data, zone_data, format_key):
-    formula_count = count_formula_segments(formula_data)
+    if project_meta.get("settings", {}).get("use_cpp_generator"):
+        formula_count = int(project_meta.get("requested_formula_count", project_meta.get("total_formula_count", 0)))
+    else:
+        formula_count = count_formula_segments(formula_data)
     zone_count = len(zone_data or [])
     actual_format = choose_export_format(format_key, formula_count)
 
@@ -971,6 +979,76 @@ def filetypes_for_format(format_key):
     ]
 
 
+def cpp_executable_path():
+    exe = Path(__file__).resolve().parent / "build" / "formula_generator"
+    return exe if exe.exists() else None
+
+
+def export_contours_for_cpp(path, cpp_contours):
+    with open(path, "w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["contour_index", "x", "y", "score", "length", "area"])
+        for contour in cpp_contours:
+            for x, y in contour["points"]:
+                writer.writerow([
+                    contour["contour_index"],
+                    f"{float(x):.6f}",
+                    f"{float(y):.6f}",
+                    f"{float(contour['score']):.6f}",
+                    f"{float(contour['length']):.6f}",
+                    f"{float(contour['area']):.6f}",
+                ])
+
+
+def contour_entries_for_cpp(contour_entries):
+    rows = []
+    for index, entry in enumerate(contour_entries, start=1):
+        pts = entry["contour"][:, 0, :].astype(float)
+        rows.append({
+            "contour_index": index,
+            "score": float(entry["score"]),
+            "length": float(entry["length"]),
+            "area": float(entry["area"]),
+            "points": pts.tolist(),
+        })
+    return rows
+
+
+def write_formula_data_with_cpp(path, actual_format, outputs, auto_delete_temp=True):
+    exe = cpp_executable_path()
+    if exe is None:
+        raise RuntimeError(
+            "C++数式生成器が見つかりません。先に `cmake -S . -B build && cmake --build build -j` を実行してください。"
+        )
+    cpp_contours = outputs.get("cpp_contours") or []
+    if not cpp_contours:
+        raise RuntimeError("C++へ渡す輪郭点列がありません。画像処理をやり直してください。")
+
+    meta = outputs["project_meta"]
+    settings = meta["settings"]
+    tmpdir = tempfile.mkdtemp(prefix="linegraphify_cpp_")
+    contour_path = os.path.join(tmpdir, "contours.csv")
+    try:
+        export_contours_for_cpp(contour_path, cpp_contours)
+        command = [
+            str(exe),
+            "--input-contours", contour_path,
+            "--output", path,
+            "--format", actual_format,
+            "--width", str(meta["processed_width"]),
+            "--height", str(meta["processed_height"]),
+            "--x-half-range", str(settings.get("x_half_range", 10.0)),
+            "--max-formulas", str(meta.get("requested_formula_count", meta["total_formula_count"])),
+        ]
+        completed = subprocess.run(command, cwd=Path(__file__).resolve().parent, text=True, capture_output=True)
+        if completed.returncode != 0:
+            raise RuntimeError((completed.stderr or completed.stdout).strip())
+        return completed.stdout.strip()
+    finally:
+        if auto_delete_temp:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def process_image_to_formulas(img_rgb, image_path, settings, callback):
     start_time = time.time()
     report_progress(callback, start_time, 3, "画像を読み込み中...", "画像を読み込み中...")
@@ -996,7 +1074,12 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
     )
 
     report_progress(callback, start_time, 62, "曲線近似中...")
-    selected_segments = build_segments_from_contours(contour_entries, settings)
+    cpp_contours = contour_entries_for_cpp(contour_entries) if settings.use_cpp_generator else []
+    preview_settings = settings
+    if settings.use_cpp_generator:
+        preview_settings = ProcessSettings(**asdict(settings))
+        preview_settings.max_total_formulas = min(settings.max_total_formulas, 2000)
+    selected_segments = build_segments_from_contours(contour_entries, preview_settings)
     report_progress(callback, start_time, 80, "曲線近似中...")
 
     report_progress(callback, start_time, 84, "プレビュー描画中...", "最終輪郭画像を描画中...")
@@ -1022,6 +1105,10 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
         scale,
         zone_data,
     )
+    project_meta["requested_formula_count"] = int(settings.max_total_formulas)
+    project_meta["preview_formula_count"] = int(project_meta["total_formula_count"])
+    if settings.use_cpp_generator:
+        project_meta["total_formula_count"] = int(settings.max_total_formulas)
 
     report_progress(callback, start_time, 100, "書き出し準備完了", "書き出し準備完了。")
     return {
@@ -1032,6 +1119,7 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
         "project_meta": project_meta,
         "formula_data": formula_data,
         "zone_data": zone_data,
+        "cpp_contours": cpp_contours,
     }
 
 
@@ -1095,6 +1183,7 @@ class ContourGraphArtApp(tk.Tk):
         self.overlay_var = tk.BooleanVar(value=False)
         self.fill_zones_var = tk.BooleanVar(value=False)
         self.major_only_var = tk.BooleanVar(value=False)
+        self.use_cpp_generator_var = tk.BooleanVar(value=False)
         self.export_format_var = tk.StringVar(value=EXPORT_FORMATS["auto"])
         self.auto_delete_temp_var = tk.BooleanVar(value=True)
         self.size_estimate_var = tk.StringVar(value="予想サイズ: 未生成")
@@ -1135,6 +1224,9 @@ class ContourGraphArtApp(tk.Tk):
         )
         ttk.Checkbutton(settings, text="領域を塗る", variable=self.fill_zones_var).grid(
             row=4, column=6, sticky="w", padx=4, pady=4
+        )
+        ttk.Checkbutton(settings, text="C++で大量数式生成", variable=self.use_cpp_generator_var).grid(
+            row=5, column=0, sticky="w", padx=4, pady=4
         )
 
         export_frame = ttk.LabelFrame(self, text="保存設定", padding=8)
@@ -1269,6 +1361,7 @@ class ContourGraphArtApp(tk.Tk):
             overlay=bool(self.overlay_var.get()),
             fill_zones=bool(self.fill_zones_var.get()),
             major_only=bool(self.major_only_var.get()),
+            use_cpp_generator=bool(self.use_cpp_generator_var.get()),
             x_half_range=float(self.x_half_range_var.get()),
         )
         if settings.max_image_size < 64:
@@ -1277,8 +1370,11 @@ class ContourGraphArtApp(tk.Tk):
             raise ValueError("Canny上限はCanny下限より大きくしてください。")
         if settings.max_total_formulas <= 0:
             raise ValueError("最大式数は1以上にしてください。")
-        if settings.max_total_formulas > 10000:
-            raise ValueError("Python GUI版の最大式数は10000までです。10万以上はC++連携版で扱います。")
+        if settings.use_cpp_generator:
+            if settings.max_total_formulas > 1000000:
+                raise ValueError("C++連携版の最大式数は100万までです。")
+        elif settings.max_total_formulas > 10000:
+            raise ValueError("Python GUI版の最大式数は10000までです。10万以上は「C++で大量数式生成」を使ってください。")
         if settings.samples_per_segment < 2:
             raise ValueError("区間サンプル数は2以上にしてください。")
         if settings.line_width <= 0:
@@ -1471,7 +1567,17 @@ class ContourGraphArtApp(tk.Tk):
         if not path:
             return
         try:
-            if actual_format == "json":
+            use_cpp = bool(self.outputs["project_meta"]["settings"].get("use_cpp_generator"))
+            if use_cpp:
+                cpp_log = write_formula_data_with_cpp(
+                    path,
+                    actual_format,
+                    self.outputs,
+                    auto_delete_temp=bool(self.auto_delete_temp_var.get()),
+                )
+                if cpp_log:
+                    self.log("C++生成器: " + cpp_log.replace("\n", " / "))
+            elif actual_format == "json":
                 write_formula_json(
                     path,
                     self.outputs["project_meta"],

@@ -8,9 +8,31 @@ Python GUI app and experimental C++ processing core for contour-based graph-art 
 python3 main.py
 ```
 
-## C++ Processing Core
+## Hybrid Python + C++ Flow
 
-The C++ core is a standalone CLI intended for large formula counts where the Python processing path becomes slow.
+The default workflow is now hybrid:
+
+- Python GUI handles image loading, OpenCV edge extraction, contour extraction, previews, and PNG output.
+- `build/formula_generator` handles large formula-file generation from contour points without depending on OpenCV C++.
+
+Build the C++ generator:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
+
+Then run the GUI:
+
+```bash
+python3 main.py
+```
+
+In the GUI, enable `C++で大量数式生成` for large formula counts. Python will make a smaller preview, and the C++ generator will write the selected formula data format when you press `数式データ保存`.
+
+## C++ OpenCV Processing Core
+
+`linegraphify_core` is an experimental full C++ OpenCV path. It is only built when a C++ OpenCV package is available.
 
 ### macOS prerequisites
 
