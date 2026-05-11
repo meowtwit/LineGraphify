@@ -1,0 +1,1235 @@
+import json
+import math
+import os
+import queue
+import threading
+import time
+import tkinter as tk
+from dataclasses import asdict, dataclass
+from tkinter import filedialog, messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageTk
+
+try:
+    import cv2
+except ImportError as exc:
+    raise ImportError(
+        "opencv-python が必要です。次を実行してください:\n"
+        "pip install opencv-python pillow numpy"
+    ) from exc
+
+
+@dataclass
+class ProcessSettings:
+    max_image_size: int = 800
+    blur_amount: int = 5
+    canny_lower: int = 20
+    canny_upper: int = 80
+    morphology_kernel: int = 3
+    min_contour_length: float = 35.0
+    min_contour_area: float = 0.0
+    approx_epsilon: float = 0.8
+    max_total_formulas: int = 450
+    samples_per_segment: int = 18
+    line_width: int = 2
+    invert_lines: bool = False
+    overlay: bool = False
+    fill_zones: bool = False
+    major_only: bool = False
+    x_half_range: float = 10.0
+
+
+def rgb_to_hex(rgb):
+    r, g, b = [int(v) for v in rgb]
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def format_seconds(seconds):
+    if seconds is None or math.isinf(seconds):
+        return "--:--:--"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
+def pil_to_tk_image(img, max_size=(410, 310)):
+    display = img.copy()
+    display.thumbnail(max_size, Image.LANCZOS)
+    return ImageTk.PhotoImage(display)
+
+
+def normalize_odd_kernel(value):
+    value = max(0, int(value))
+    if value == 0:
+        return 0
+    return value if value % 2 == 1 else value + 1
+
+
+def resize_to_max_side(img_rgb, max_side):
+    h, w = img_rgb.shape[:2]
+    max_side = max(64, int(max_side))
+    scale = min(1.0, max_side / max(h, w))
+    if scale >= 1.0:
+        return img_rgb.copy(), 1.0
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+def pixel_to_math(point, width, height, x_half_range):
+    px, py = float(point[0]), float(point[1])
+    scale = (2.0 * x_half_range) / max(width - 1, 1)
+    y_half_range = scale * (height - 1) / 2.0
+    return np.array([-x_half_range + px * scale, y_half_range - py * scale], dtype=float)
+
+
+def cubic_expression_string(a, b, c, d):
+    return f"{a:.6f}*t^3 + {b:.6f}*t^2 + {c:.6f}*t + {d:.6f}"
+
+
+def bezier_to_power_basis(seg):
+    b0, b1, b2, b3 = [np.asarray(p, dtype=float) for p in seg]
+    a = -b0 + 3 * b1 - 3 * b2 + b3
+    b = 3 * b0 - 6 * b1 + 3 * b2
+    c = -3 * b0 + 3 * b1
+    d = b0
+    return a, b, c, d
+
+
+def catmull_rom_closed_to_beziers(points):
+    pts = np.asarray(points, dtype=float)
+    n = len(pts)
+    if n < 2:
+        return []
+
+    if n == 2:
+        p0, p1 = pts[0], pts[1]
+        return [(p0, p0 + (p1 - p0) / 3.0, p0 + 2.0 * (p1 - p0) / 3.0, p1)]
+
+    segments = []
+    for i in range(n):
+        p0 = pts[(i - 1) % n]
+        p1 = pts[i]
+        p2 = pts[(i + 1) % n]
+        p3 = pts[(i + 2) % n]
+        b0 = p1
+        b1 = p1 + (p2 - p0) / 6.0
+        b2 = p2 - (p3 - p1) / 6.0
+        b3 = p2
+        segments.append((b0, b1, b2, b3))
+    return segments
+
+
+def catmull_rom_open_to_beziers(points):
+    pts = np.asarray(points, dtype=float)
+    n = len(pts)
+    if n < 2:
+        return []
+
+    segments = []
+    for i in range(n - 1):
+        p0 = pts[i - 1] if i > 0 else pts[i]
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        p3 = pts[i + 2] if i + 2 < n else pts[i + 1]
+        b0 = p1
+        b1 = p1 + (p2 - p0) / 6.0
+        b2 = p2 - (p3 - p1) / 6.0
+        b3 = p2
+        segments.append((b0, b1, b2, b3))
+    return segments
+
+
+def closed_polyline_to_cubic_segments(points):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return []
+
+    segments = []
+    for i in range(len(pts)):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % len(pts)]
+        segments.append((p0, p0 + (p1 - p0) / 3.0, p0 + 2.0 * (p1 - p0) / 3.0, p1))
+    return segments
+
+
+def open_polyline_to_cubic_segments(points):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return []
+
+    lengths = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    median_length = float(np.median(lengths)) if len(lengths) else 0.0
+    max_jump = min(max(35.0, median_length * 3.0), 90.0)
+
+    segments = []
+    for i in range(len(pts) - 1):
+        p0 = pts[i]
+        p1 = pts[i + 1]
+        if np.linalg.norm(p1 - p0) > max_jump:
+            continue
+        segments.append((p0, p0 + (p1 - p0) / 3.0, p0 + 2.0 * (p1 - p0) / 3.0, p1))
+    return segments
+
+
+def sample_cubic_bezier(seg, samples=18):
+    b0, b1, b2, b3 = [np.asarray(p, dtype=float) for p in seg]
+    t = np.linspace(0.0, 1.0, max(2, int(samples)))[:, None]
+    return (
+        ((1 - t) ** 3) * b0
+        + 3 * ((1 - t) ** 2) * t * b1
+        + 3 * (1 - t) * (t**2) * b2
+        + (t**3) * b3
+    )
+
+
+def contour_points(contour):
+    return contour[:, 0, :].astype(float)
+
+
+def closed_polyline_length(points):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return 0.0
+    shifted = np.roll(pts, -1, axis=0)
+    return float(np.sum(np.linalg.norm(shifted - pts, axis=1)))
+
+
+def resample_closed_polyline(points, target_count):
+    pts = np.asarray(points, dtype=float)
+    target_count = max(2, int(target_count))
+    if len(pts) <= target_count:
+        return pts
+
+    closed = np.vstack([pts, pts[0]])
+    deltas = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    total = float(np.sum(deltas))
+    if total <= 0:
+        return pts[:target_count]
+
+    cumulative = np.concatenate([[0.0], np.cumsum(deltas)])
+    distances = np.linspace(0.0, total, target_count, endpoint=False)
+    out = []
+    for distance in distances:
+        idx = int(np.searchsorted(cumulative, distance, side="right") - 1)
+        idx = min(idx, len(deltas) - 1)
+        span = max(deltas[idx], 1e-9)
+        local_t = (distance - cumulative[idx]) / span
+        out.append(closed[idx] * (1.0 - local_t) + closed[idx + 1] * local_t)
+    return np.asarray(out, dtype=float)
+
+
+def open_polyline_length(points):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+
+
+def resample_open_polyline(points, target_count):
+    pts = np.asarray(points, dtype=float)
+    target_count = max(2, int(target_count))
+    if len(pts) <= target_count:
+        return pts
+
+    deltas = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    total = float(np.sum(deltas))
+    if total <= 0:
+        return pts[:target_count]
+
+    cumulative = np.concatenate([[0.0], np.cumsum(deltas)])
+    distances = np.linspace(0.0, total, target_count)
+    out = []
+    for distance in distances:
+        idx = int(np.searchsorted(cumulative, distance, side="right") - 1)
+        idx = min(idx, len(deltas) - 1)
+        span = max(deltas[idx], 1e-9)
+        local_t = (distance - cumulative[idx]) / span
+        out.append(pts[idx] * (1.0 - local_t) + pts[idx + 1] * local_t)
+    return np.asarray(out, dtype=float)
+
+
+def allocate_formula_budget(contour_entries, budget, min_per_contour=4):
+    budget = max(0, int(budget))
+    if budget <= 0 or not contour_entries:
+        return []
+
+    max_selected = max(1, min(len(contour_entries), budget // max(1, min_per_contour), budget // 8))
+    contour_entries = contour_entries[:max_selected]
+
+    selected = []
+    remaining = budget
+    for entry in contour_entries:
+        if remaining < min_per_contour:
+            break
+        cap = int(entry["max_segments"])
+        if cap < min_per_contour:
+            continue
+        selected.append({"entry": entry, "allocation": min_per_contour, "cap": cap})
+        remaining -= min_per_contour
+
+    if not selected:
+        return []
+
+    while remaining > 0:
+        candidates = [item for item in selected if item["allocation"] < item["cap"]]
+        if not candidates:
+            break
+        weights = np.array([max(item["entry"]["score"], 1.0) for item in candidates], dtype=float)
+        desired = weights / float(np.sum(weights)) * remaining
+        increments = np.floor(desired).astype(int)
+        if int(np.sum(increments)) == 0:
+            order = np.argsort(-(desired - increments))
+            for idx in order:
+                item = candidates[int(idx)]
+                if item["allocation"] < item["cap"]:
+                    item["allocation"] += 1
+                    remaining -= 1
+                    break
+            continue
+
+        for item, inc in zip(candidates, increments):
+            if remaining <= 0:
+                break
+            room = item["cap"] - item["allocation"]
+            add = min(int(inc), room, remaining)
+            item["allocation"] += add
+            remaining -= add
+
+    return [(item["entry"], int(item["allocation"])) for item in selected]
+
+
+def make_preview_from_array(arr):
+    if arr.ndim == 2:
+        return Image.fromarray(arr).convert("RGB")
+    return Image.fromarray(arr).convert("RGB")
+
+
+def report_progress(callback, start_time, progress, status, log=None):
+    elapsed = time.time() - start_time
+    eta = elapsed * (100.0 - progress) / progress if progress > 0 else None
+    callback({"type": "progress", "value": progress, "eta": eta, "status": status})
+    if log:
+        callback({"type": "log", "text": log})
+
+
+def preprocess_edges(img_rgb, settings):
+    # Oil-painting texture creates many false edges. Bilateral smoothing keeps
+    # large boundaries while reducing brush-stroke speckles.
+    denoised = cv2.bilateralFilter(img_rgb, d=9, sigmaColor=60, sigmaSpace=60)
+    gray = cv2.cvtColor(denoised, cv2.COLOR_RGB2GRAY)
+    blur_kernel = normalize_odd_kernel(settings.blur_amount)
+    if blur_kernel > 0:
+        gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+
+    edges = cv2.Canny(gray, int(settings.canny_lower), int(settings.canny_upper), L2gradient=True)
+
+    kernel_size = max(0, int(settings.morphology_kernel))
+    if kernel_size > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+    edges = remove_small_edge_components(edges, settings)
+
+    return gray, edges
+
+
+def remove_small_edge_components(edges, settings):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+    cleaned = np.zeros_like(edges)
+
+    min_pixels = max(6, int(settings.min_contour_length * 0.20))
+    min_span = max(6, int(settings.min_contour_length * 0.18))
+
+    for label in range(1, num_labels):
+        x, y, w, h, area = stats[label]
+        if area < min_pixels:
+            continue
+        if max(w, h) < min_span:
+            continue
+        cleaned[labels == label] = 255
+
+    return cleaned
+
+
+def iter_pixel_neighbors(pixel, pixels):
+    y, x = pixel
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            candidate = (y + dy, x + dx)
+            if candidate in pixels:
+                yield candidate
+
+
+def edge_key(a, b):
+    return (a, b) if a <= b else (b, a)
+
+
+def trace_component_paths(component_mask):
+    ys, xs = np.where(component_mask > 0)
+    pixels = set(zip(ys.tolist(), xs.tolist()))
+    if len(pixels) < 2:
+        return []
+
+    neighbors = {pixel: list(iter_pixel_neighbors(pixel, pixels)) for pixel in pixels}
+    degrees = {pixel: len(items) for pixel, items in neighbors.items()}
+    starts = [pixel for pixel, degree in degrees.items() if degree != 2]
+    if not starts:
+        starts = [next(iter(pixels))]
+
+    visited_edges = set()
+    paths = []
+
+    def walk(start, nxt):
+        path = [start]
+        prev = start
+        curr = nxt
+        visited_edges.add(edge_key(prev, curr))
+
+        while True:
+            path.append(curr)
+            choices = [
+                item
+                for item in neighbors[curr]
+                if item != prev and edge_key(curr, item) not in visited_edges
+            ]
+            if degrees[curr] != 2 or not choices:
+                break
+            prev, curr = curr, choices[0]
+            visited_edges.add(edge_key(prev, curr))
+            if curr == start:
+                path.append(curr)
+                break
+
+        return path
+
+    for start in starts:
+        for nxt in neighbors[start]:
+            if edge_key(start, nxt) in visited_edges:
+                continue
+            path = walk(start, nxt)
+            if len(path) >= 2:
+                paths.append(path)
+
+    # Closed loops have no endpoints. Trace any remaining unvisited edge.
+    for start, items in neighbors.items():
+        for nxt in items:
+            if edge_key(start, nxt) in visited_edges:
+                continue
+            path = walk(start, nxt)
+            if len(path) >= 2:
+                paths.append(path)
+
+    return paths
+
+
+def extract_curve_entries(edges, settings):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+    entries = []
+
+    for label in range(1, num_labels):
+        x, y, w, h, component_area = stats[label]
+        if settings.major_only and max(w, h) < max(edges.shape[:2]) * 0.08:
+            continue
+
+        component_mask = np.where(labels[y : y + h, x : x + w] == label, 255, 0).astype(np.uint8)
+        paths = trace_component_paths(component_mask)
+
+        for path in paths:
+            pts = np.asarray([[px + x, py + y] for py, px in path], dtype=np.float32)
+            length = open_polyline_length(pts)
+            if length < settings.min_contour_length:
+                continue
+
+            px_min = float(np.min(pts[:, 0]))
+            py_min = float(np.min(pts[:, 1]))
+            px_max = float(np.max(pts[:, 0]))
+            py_max = float(np.max(pts[:, 1]))
+            path_w = px_max - px_min + 1.0
+            path_h = py_max - py_min + 1.0
+            bbox_span = max(path_w, path_h)
+            bbox_diag = math.hypot(path_w, path_h)
+            area = path_w * path_h
+            if settings.min_contour_area > 0 and area < settings.min_contour_area:
+                continue
+            if bbox_span < settings.min_contour_length * 0.25:
+                continue
+
+            epsilon = max(0.0, length * float(settings.approx_epsilon) / 100.0)
+            approx = cv2.approxPolyDP(pts.reshape((-1, 1, 2)), epsilon, False)
+            approx_pts = contour_points(approx)
+            if len(approx_pts) < 2:
+                continue
+
+            max_segments = min(max(1, len(approx_pts) - 1), max(2, int(settings.max_total_formulas)))
+            score = length + bbox_diag * 3.0 + math.sqrt(max(component_area, 0.0)) * 2.0
+            entries.append(
+                {
+                    "approx_points": approx_pts,
+                    "length": length,
+                    "area": area,
+                    "bbox": [int(px_min), int(py_min), int(path_w), int(path_h)],
+                    "max_segments": max_segments,
+                    "score": score,
+                }
+            )
+
+    entries.sort(key=lambda item: item["score"], reverse=True)
+    return entries
+
+
+def extract_contour_entries(edges, settings):
+    mode = cv2.RETR_EXTERNAL if settings.major_only else cv2.RETR_LIST
+    contours_info = cv2.findContours(edges, mode, cv2.CHAIN_APPROX_NONE)
+    contours = contours_info[-2]
+    entries = []
+
+    for contour in contours:
+        length = float(cv2.arcLength(contour, True))
+        area = float(abs(cv2.contourArea(contour)))
+        x, y, w, h = cv2.boundingRect(contour)
+        bbox_span = float(max(w, h))
+        bbox_diag = math.hypot(w, h)
+        if length < settings.min_contour_length:
+            continue
+        if settings.min_contour_area > 0 and area < settings.min_contour_area:
+            continue
+        if bbox_span < settings.min_contour_length * 0.25:
+            continue
+
+        epsilon = max(0.0, length * float(settings.approx_epsilon) / 100.0)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        pts = contour_points(approx)
+        if len(pts) < 2:
+            continue
+
+        max_segments = min(len(pts), max(2, int(settings.max_total_formulas)))
+        score = length + bbox_diag * 2.5 + math.sqrt(max(area, 0.0)) * 4.0
+        entries.append(
+            {
+                "contour": contour,
+                "approx_points": pts,
+                "length": length,
+                "area": area,
+                "bbox": [int(x), int(y), int(w), int(h)],
+                "max_segments": max_segments,
+                "score": score,
+            }
+        )
+
+    entries.sort(key=lambda item: item["score"], reverse=True)
+    return entries
+
+
+def render_segments(width, height, img_rgb, selected_segments, settings):
+    if settings.overlay:
+        base = Image.fromarray(img_rgb).convert("RGB")
+        line_color = (255, 255, 255) if settings.invert_lines else (0, 0, 0)
+    else:
+        bg = (0, 0, 0) if settings.invert_lines else (255, 255, 255)
+        line_color = (255, 255, 255) if settings.invert_lines else (0, 0, 0)
+        base = Image.new("RGB", (width, height), bg)
+
+    draw = ImageDraw.Draw(base)
+    for seg in selected_segments:
+        pts = []
+        for bezier in seg["beziers"]:
+            sampled = sample_cubic_bezier(bezier, settings.samples_per_segment)
+            if pts:
+                sampled = sampled[1:]
+            pts.extend((float(x), float(y)) for x, y in sampled)
+        if len(pts) >= 2:
+            draw.line(pts, fill=line_color, width=max(1, int(settings.line_width)), joint="curve")
+    return base
+
+
+def render_edge_line_image(edges, img_rgb, settings):
+    line_mask = thicken_boundary_mask(edges, settings.line_width)
+
+    if settings.overlay:
+        base = Image.fromarray(img_rgb).convert("RGB")
+        overlay = Image.new("RGB", base.size, (255, 255, 255) if settings.invert_lines else (0, 0, 0))
+        mask = Image.fromarray(line_mask).convert("L")
+        base.paste(overlay, mask=mask)
+        return base
+
+    if settings.invert_lines:
+        arr = np.where(line_mask > 0, 255, 0).astype(np.uint8)
+    else:
+        arr = np.where(line_mask > 0, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr).convert("RGB")
+
+
+def thicken_boundary_mask(edges, line_width):
+    line_mask = edges.copy()
+    width = max(1, int(line_width))
+    if width > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (width, width))
+        line_mask = cv2.dilate(line_mask, kernel, iterations=1)
+    return line_mask
+
+
+def render_formula_boundary_mask(width, height, selected_segments, settings):
+    mask_img = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask_img)
+    draw_width = max(1, int(settings.line_width))
+
+    for seg in selected_segments:
+        for bezier in seg["beziers"]:
+            sampled = sample_cubic_bezier(bezier, settings.samples_per_segment)
+            pts = [(float(x), float(y)) for x, y in sampled]
+            if len(pts) >= 2:
+                draw.line(pts, fill=255, width=draw_width, joint="curve")
+
+    mask = np.array(mask_img, dtype=np.uint8)
+    if draw_width > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (draw_width, draw_width))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+    # The image border is a valid boundary for flood-filled zones.
+    mask[0, :] = 255
+    mask[-1, :] = 255
+    mask[:, 0] = 255
+    mask[:, -1] = 255
+    return mask
+
+
+def color_zones_from_boundary(boundary_mask, img_rgb, settings):
+    free_mask = np.where(boundary_mask > 0, 0, 255).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(free_mask, connectivity=4)
+
+    filled = np.zeros_like(img_rgb)
+    zone_data = []
+
+    for label in range(1, num_labels):
+        x, y, w, h, area = stats[label]
+        if area <= 0:
+            continue
+        zone_pixels = labels == label
+        color = np.mean(img_rgb[zone_pixels], axis=0)
+        color = np.clip(np.round(color), 0, 255).astype(np.uint8)
+        filled[zone_pixels] = color
+        zone_data.append(
+            {
+                "zone_index": len(zone_data) + 1,
+                "pixel_count": int(area),
+                "bbox": [int(x), int(y), int(w), int(h)],
+                "fill_rgb": [int(color[0]), int(color[1]), int(color[2])],
+                "fill_hex": rgb_to_hex(color),
+            }
+        )
+
+    line_color = 255 if settings.invert_lines else 0
+    filled[boundary_mask > 0] = line_color
+    return Image.fromarray(filled).convert("RGB"), zone_data
+
+
+def build_segments_from_contours(contour_entries, settings):
+    budget = max(1, int(settings.max_total_formulas))
+    selected_segments = []
+    used = 0
+
+    # Increase simplification only if the first pass cannot include enough
+    # coherent contours. This preserves recognizable local shapes better than
+    # forcing every contour into an arbitrary segment allocation.
+    for multiplier in (0.12, 0.2, 0.35, 0.55, 0.8, 1.0, 1.4, 2.0, 3.0, 4.5, 6.0):
+        candidates = []
+        for entry in contour_entries:
+            epsilon = max(0.0, entry["length"] * float(settings.approx_epsilon) / 100.0 * multiplier)
+            approx = cv2.approxPolyDP(entry["contour"], epsilon, False)
+            pts = contour_points(approx)
+            if len(pts) < 2:
+                continue
+            segment_count = len(pts)
+            candidates.append((entry, pts, segment_count))
+
+        candidates.sort(key=lambda item: item[0]["score"], reverse=True)
+        trial = []
+        trial_used = 0
+        for entry, pts, segment_count in candidates:
+            remaining = budget - trial_used
+            if remaining <= 0:
+                break
+            if segment_count > remaining:
+                if remaining < 2:
+                    break
+                pts = resample_open_polyline(pts, remaining + 1)
+                segment_count = len(pts) - 1
+            beziers = open_polyline_to_cubic_segments(pts)
+            if not beziers:
+                continue
+            trial.append(
+                {
+                    "source_index": len(trial) + 1,
+                    "length": entry["length"],
+                    "area": entry["area"],
+                    "beziers": beziers,
+                }
+            )
+            trial_used += len(beziers)
+            if trial_used >= budget:
+                break
+
+        selected_segments = trial
+        used = trial_used
+        if used >= budget * 0.75 or multiplier == 6.0:
+            break
+
+    return selected_segments
+
+
+def build_formula_exports(selected_segments, width, height, settings, image_path, scale, zone_data=None):
+    formula_data = []
+    total = 0
+
+    for contour_index, contour_entry in enumerate(selected_segments, start=1):
+        segments = []
+        for segment_index, bezier_px in enumerate(contour_entry["beziers"], start=1):
+            math_seg = tuple(
+                pixel_to_math(point, width, height, settings.x_half_range) for point in bezier_px
+            )
+            a, b, c, d = bezier_to_power_basis(math_seg)
+            segments.append(
+                {
+                    "segment_index": segment_index,
+                    "x_coefficients": [float(a[0]), float(b[0]), float(c[0]), float(d[0])],
+                    "y_coefficients": [float(a[1]), float(b[1]), float(c[1]), float(d[1])],
+                    "x": cubic_expression_string(a[0], b[0], c[0], d[0]),
+                    "y": cubic_expression_string(a[1], b[1], c[1], d[1]),
+                    "domain": "0 <= t <= 1",
+                    "sampled_points_px": [
+                        [float(x), float(y)]
+                        for x, y in sample_cubic_bezier(bezier_px, settings.samples_per_segment)
+                    ],
+                }
+            )
+
+        total += len(segments)
+        formula_data.append(
+            {
+                "contour_index": contour_index,
+                "source_length_px": float(contour_entry["length"]),
+                "source_area_px": float(contour_entry["area"]),
+                "allocated_formula_count": len(segments),
+                "segments": segments,
+            }
+        )
+
+    project_meta = {
+        "app": "Contour Graph Art Formula Generator",
+        "source_image_path": image_path,
+        "processed_width": width,
+        "processed_height": height,
+        "resize_scale_from_original": float(scale),
+        "settings": asdict(settings),
+        "total_formula_count": total,
+        "zone_count": len(zone_data or []),
+        "coordinate_system": {
+            "x": "centered horizontally",
+            "y": "centered vertically, positive upward",
+            "segment_domain": "0 <= t <= 1",
+            "x_half_range": settings.x_half_range,
+        },
+    }
+    return project_meta, formula_data
+
+
+def build_formula_text(project_meta, formula_data):
+    lines = [
+        "=== Contour Graph Art Formula Export ===",
+        "",
+        f"Source image: {project_meta['source_image_path']}",
+        f"Processed size: {project_meta['processed_width']} x {project_meta['processed_height']}",
+        f"Total formulas: {project_meta['total_formula_count']}",
+        f"Paint zones: {project_meta.get('zone_count', 0)}",
+        "",
+        "Formula form:",
+        "  x(t) = a*t^3 + b*t^2 + c*t + d",
+        "  y(t) = e*t^3 + f*t^2 + g*t + h",
+        "  domain: 0 <= t <= 1",
+        "",
+        "Coordinate system:",
+        "  origin is image center",
+        "  x is positive to the right",
+        "  y is positive upward",
+        "",
+        "Settings:",
+    ]
+
+    for key, value in project_meta["settings"].items():
+        lines.append(f"  {key}: {value}")
+    lines.append("")
+
+    for contour in formula_data:
+        lines.append("--------------------------------------------------")
+        lines.append(
+            f"Contour {contour['contour_index']} | "
+            f"length_px={contour['source_length_px']:.2f} | "
+            f"area_px={contour['source_area_px']:.2f} | "
+            f"formulas={contour['allocated_formula_count']}"
+        )
+        for segment in contour["segments"]:
+            lines.append(f"  Segment {segment['segment_index']}")
+            lines.append(f"    x(t) = {segment['x']}")
+            lines.append(f"    y(t) = {segment['y']}")
+            lines.append(f"    domain: {segment['domain']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def process_image_to_formulas(img_rgb, image_path, settings, callback):
+    start_time = time.time()
+    report_progress(callback, start_time, 3, "Loading image...", "Loading image...")
+
+    processed_rgb, scale = resize_to_max_side(img_rgb, settings.max_image_size)
+    h, w = processed_rgb.shape[:2]
+
+    report_progress(callback, start_time, 13, "Preprocessing...", "Preprocessing image...")
+    gray, edges = preprocess_edges(processed_rgb, settings)
+
+    report_progress(callback, start_time, 30, "Extracting contours...", "Detecting edge contours...")
+    contour_entries = extract_contour_entries(edges, settings)
+    if not contour_entries:
+        raise ValueError("No contours found. Lower Canny thresholds or min contour filters.")
+
+    callback({"type": "contours", "rows": contour_entries[:300], "total": len(contour_entries)})
+    report_progress(
+        callback,
+        start_time,
+        45,
+        "Allocating formula budget...",
+        f"Found {len(contour_entries)} usable contours.",
+    )
+
+    report_progress(callback, start_time, 62, "Fitting curves...")
+    selected_segments = build_segments_from_contours(contour_entries, settings)
+    report_progress(callback, start_time, 80, "Fitting curves...")
+
+    report_progress(callback, start_time, 84, "Rendering preview...", "Rendering final contour image...")
+    zone_data = []
+    if settings.fill_zones:
+        boundary = thicken_boundary_mask(edges, settings.line_width)
+        result_image, zone_data = color_zones_from_boundary(boundary, processed_rgb, settings)
+    else:
+        result_image = render_edge_line_image(edges, processed_rgb, settings)
+    edge_image = make_preview_from_array(edges)
+    gray_image = make_preview_from_array(gray)
+    processed_image = Image.fromarray(processed_rgb).convert("RGB")
+
+    report_progress(callback, start_time, 93, "Building formula export...", "Building TXT/JSON formula data...")
+    project_meta, formula_data = build_formula_exports(
+        selected_segments,
+        w,
+        h,
+        settings,
+        image_path,
+        scale,
+        zone_data,
+    )
+
+    report_progress(callback, start_time, 100, "Export ready", "Export ready.")
+    return {
+        "processed_image": processed_image,
+        "gray_image": gray_image,
+        "edge_image": edge_image,
+        "result_image": result_image,
+        "project_meta": project_meta,
+        "formula_data": formula_data,
+        "zone_data": zone_data,
+    }
+
+
+class ContourGraphArtApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Contour Graph Art Formula Generator")
+        self.geometry("1480x980")
+        self.minsize(1220, 820)
+
+        self.original_image_pil = None
+        self.original_image_np = None
+        self.original_image_path = None
+        self.outputs = None
+        self.processing_thread = None
+        self.queue = queue.Queue()
+
+        self._build_ui()
+        self.after(100, self._process_queue)
+
+    def _build_ui(self):
+        top = ttk.Frame(self, padding=8)
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(top, text="画像読み込み", command=self.load_image).pack(side=tk.LEFT, padx=4)
+        self.run_button = ttk.Button(top, text="処理開始", command=self.start_processing)
+        self.run_button.pack(side=tk.LEFT, padx=4)
+        self.save_png_button = ttk.Button(top, text="PNG保存", command=self.save_png, state=tk.DISABLED)
+        self.save_png_button.pack(side=tk.LEFT, padx=4)
+        self.save_txt_button = ttk.Button(top, text="数式TXT保存", command=self.save_txt, state=tk.DISABLED)
+        self.save_txt_button.pack(side=tk.LEFT, padx=4)
+        self.save_json_button = ttk.Button(top, text="数式JSON保存", command=self.save_json, state=tk.DISABLED)
+        self.save_json_button.pack(side=tk.LEFT, padx=4)
+
+        self.file_label = ttk.Label(top, text="No image loaded")
+        self.file_label.pack(side=tk.LEFT, padx=12)
+
+        self._build_settings()
+        self._build_previews()
+        self._build_progress_and_logs()
+
+    def _build_settings(self):
+        settings = ttk.LabelFrame(self, text="Parameters", padding=8)
+        settings.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        self.max_image_size_var = tk.IntVar(value=800)
+        self.blur_amount_var = tk.IntVar(value=5)
+        self.canny_lower_var = tk.IntVar(value=20)
+        self.canny_upper_var = tk.IntVar(value=80)
+        self.morphology_kernel_var = tk.IntVar(value=3)
+        self.min_contour_length_var = tk.DoubleVar(value=35.0)
+        self.min_contour_area_var = tk.DoubleVar(value=0.0)
+        self.approx_epsilon_var = tk.DoubleVar(value=0.8)
+        self.max_total_formulas_var = tk.IntVar(value=450)
+        self.samples_per_segment_var = tk.IntVar(value=18)
+        self.line_width_var = tk.IntVar(value=2)
+        self.x_half_range_var = tk.DoubleVar(value=10.0)
+        self.invert_lines_var = tk.BooleanVar(value=False)
+        self.overlay_var = tk.BooleanVar(value=False)
+        self.fill_zones_var = tk.BooleanVar(value=False)
+        self.major_only_var = tk.BooleanVar(value=False)
+
+        fields = [
+            ("Max image size", self.max_image_size_var),
+            ("Blur amount", self.blur_amount_var),
+            ("Canny lower", self.canny_lower_var),
+            ("Canny upper", self.canny_upper_var),
+            ("Morphology kernel", self.morphology_kernel_var),
+            ("Min contour length", self.min_contour_length_var),
+            ("Min contour area", self.min_contour_area_var),
+            ("Approx epsilon %", self.approx_epsilon_var),
+            ("Max total formulas", self.max_total_formulas_var),
+            ("Samples / segment", self.samples_per_segment_var),
+            ("Line width", self.line_width_var),
+            ("Math x half-range", self.x_half_range_var),
+        ]
+
+        for index, (label, variable) in enumerate(fields):
+            row = index // 4
+            col = (index % 4) * 2
+            ttk.Label(settings, text=label).grid(row=row, column=col, sticky="w", padx=4, pady=4)
+            ttk.Entry(settings, textvariable=variable, width=10).grid(
+                row=row, column=col + 1, sticky="w", padx=4, pady=4
+            )
+
+        ttk.Checkbutton(settings, text="Invert lines", variable=self.invert_lines_var).grid(
+            row=3, column=0, sticky="w", padx=4, pady=4
+        )
+        ttk.Checkbutton(settings, text="Overlay on original", variable=self.overlay_var).grid(
+            row=3, column=2, sticky="w", padx=4, pady=4
+        )
+        ttk.Checkbutton(settings, text="Major contours only", variable=self.major_only_var).grid(
+            row=3, column=4, sticky="w", padx=4, pady=4
+        )
+        ttk.Checkbutton(settings, text="Fill zones", variable=self.fill_zones_var).grid(
+            row=3, column=6, sticky="w", padx=4, pady=4
+        )
+
+    def _build_previews(self):
+        previews = ttk.Frame(self, padding=(8, 0, 8, 8))
+        previews.pack(side=tk.TOP, fill=tk.BOTH, expand=False)
+
+        self.preview_labels = {}
+        for title, key in [
+            ("元画像", "original"),
+            ("処理対象", "processed"),
+            ("抽出エッジ", "edges"),
+            ("関数近似結果", "result"),
+        ]:
+            frame = ttk.LabelFrame(previews, text=title, padding=8)
+            frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+            label = ttk.Label(frame, text="No image", anchor="center")
+            label.pack(fill=tk.BOTH, expand=True)
+            self.preview_labels[key] = label
+
+    def _build_progress_and_logs(self):
+        progress_frame = ttk.LabelFrame(self, text="Progress", padding=8)
+        progress_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        self.status_var = tk.StringVar(value="Idle")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.eta_var = tk.StringVar(value="ETA: --:--:--")
+        ttk.Label(progress_frame, textvariable=self.status_var).pack(anchor="w")
+        ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).pack(fill=tk.X, pady=6)
+        ttk.Label(progress_frame, textvariable=self.eta_var).pack(anchor="w")
+
+        bottom = ttk.Frame(self, padding=(8, 0, 8, 8))
+        bottom.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        contours_box = ttk.LabelFrame(bottom, text="Contour Allocation", padding=8)
+        contours_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+
+        columns = ("rank", "length", "area", "max_segments")
+        self.tree = ttk.Treeview(contours_box, columns=columns, show="headings", height=13)
+        for column, heading, width in [
+            ("rank", "Rank", 60),
+            ("length", "Length", 110),
+            ("area", "Area", 110),
+            ("max_segments", "Max Segments", 120),
+        ]:
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=width, anchor="e")
+        self.tree.pack(fill=tk.BOTH, expand=True)
+
+        log_box = ttk.LabelFrame(bottom, text="Log", padding=8)
+        log_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        self.log_text = ScrolledText(log_box, wrap=tk.WORD, height=13)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.insert(tk.END, "Ready.\n")
+        self.log_text.configure(state=tk.DISABLED)
+
+    def log(self, text):
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, text + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def load_image(self):
+        path = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            img = Image.open(path).convert("RGB")
+            self.original_image_pil = img
+            self.original_image_np = np.array(img)
+            self.original_image_path = path
+            self.outputs = None
+            self.file_label.configure(text=os.path.basename(path))
+            self._set_preview("original", img)
+            for key in ("processed", "edges", "result"):
+                self.preview_labels[key].configure(image="", text="No image")
+                self.preview_labels[key].image = None
+            self._set_save_state(tk.DISABLED)
+            self._clear_tree()
+            self.progress_var.set(0)
+            self.status_var.set("Image loaded")
+            self.eta_var.set("ETA: --:--:--")
+            self.log(f"Loaded image: {path}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to load image.\n\n{exc}")
+
+    def _read_settings(self):
+        settings = ProcessSettings(
+            max_image_size=int(self.max_image_size_var.get()),
+            blur_amount=int(self.blur_amount_var.get()),
+            canny_lower=int(self.canny_lower_var.get()),
+            canny_upper=int(self.canny_upper_var.get()),
+            morphology_kernel=int(self.morphology_kernel_var.get()),
+            min_contour_length=float(self.min_contour_length_var.get()),
+            min_contour_area=float(self.min_contour_area_var.get()),
+            approx_epsilon=float(self.approx_epsilon_var.get()),
+            max_total_formulas=int(self.max_total_formulas_var.get()),
+            samples_per_segment=int(self.samples_per_segment_var.get()),
+            line_width=int(self.line_width_var.get()),
+            invert_lines=bool(self.invert_lines_var.get()),
+            overlay=bool(self.overlay_var.get()),
+            fill_zones=bool(self.fill_zones_var.get()),
+            major_only=bool(self.major_only_var.get()),
+            x_half_range=float(self.x_half_range_var.get()),
+        )
+        if settings.max_image_size < 64:
+            raise ValueError("Max image size must be at least 64.")
+        if settings.canny_lower < 0 or settings.canny_upper <= settings.canny_lower:
+            raise ValueError("Canny upper must be greater than Canny lower.")
+        if settings.max_total_formulas <= 0:
+            raise ValueError("Max total formulas must be positive.")
+        if settings.max_total_formulas > 10000:
+            raise ValueError("Max total formulas is capped at 10000.")
+        if settings.samples_per_segment < 2:
+            raise ValueError("Samples per segment must be at least 2.")
+        if settings.line_width <= 0:
+            raise ValueError("Line width must be positive.")
+        if settings.x_half_range <= 0:
+            raise ValueError("Math x half-range must be positive.")
+        return settings
+
+    def start_processing(self):
+        if self.original_image_np is None:
+            messagebox.showwarning("Warning", "Load an image first.")
+            return
+        if self.processing_thread is not None and self.processing_thread.is_alive():
+            messagebox.showinfo("Info", "Processing is already running.")
+            return
+
+        try:
+            settings = self._read_settings()
+        except Exception as exc:
+            messagebox.showerror("Error", f"Invalid parameters.\n\n{exc}")
+            return
+
+        self.run_button.configure(state=tk.DISABLED)
+        self._set_save_state(tk.DISABLED)
+        self._clear_tree()
+        self.progress_var.set(0.0)
+        self.status_var.set("Starting...")
+        self.eta_var.set("ETA: --:--:--")
+        self.log("Starting contour-based processing.")
+
+        self.processing_thread = threading.Thread(
+            target=self._worker_process,
+            args=(settings,),
+            daemon=True,
+        )
+        self.processing_thread.start()
+
+    def _worker_process(self, settings):
+        try:
+            outputs = process_image_to_formulas(
+                self.original_image_np.copy(),
+                self.original_image_path,
+                settings,
+                self.queue.put,
+            )
+            self.queue.put({"type": "finished", "outputs": outputs})
+        except Exception as exc:
+            self.queue.put({"type": "error", "text": str(exc)})
+
+    def _process_queue(self):
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                msg_type = msg.get("type")
+
+                if msg_type == "log":
+                    self.log(msg["text"])
+                elif msg_type == "progress":
+                    self.progress_var.set(msg["value"])
+                    self.status_var.set(msg["status"])
+                    self.eta_var.set(f"ETA: {format_seconds(msg['eta'])}")
+                elif msg_type == "contours":
+                    self._populate_contours(msg["rows"], msg["total"])
+                elif msg_type == "finished":
+                    self.outputs = msg["outputs"]
+                    self._set_preview("processed", self.outputs["processed_image"])
+                    self._set_preview("edges", self.outputs["edge_image"])
+                    self._set_preview("result", self.outputs["result_image"])
+                    self.progress_var.set(100.0)
+                    self.status_var.set("Export ready")
+                    self.eta_var.set("ETA: 00:00:00")
+                    self.run_button.configure(state=tk.NORMAL)
+                    self._set_save_state(tk.NORMAL)
+                    total = self.outputs["project_meta"]["total_formula_count"]
+                    self.log(f"Completed. Total formulas: {total}")
+                elif msg_type == "error":
+                    self.run_button.configure(state=tk.NORMAL)
+                    self.status_var.set("Error")
+                    self.log("ERROR: " + msg["text"])
+                    messagebox.showerror("Processing Error", msg["text"])
+        except queue.Empty:
+            pass
+
+        self.after(100, self._process_queue)
+
+    def _set_preview(self, key, image):
+        photo = pil_to_tk_image(image)
+        self.preview_labels[key].configure(image=photo, text="")
+        self.preview_labels[key].image = photo
+
+    def _set_save_state(self, state):
+        self.save_png_button.configure(state=state)
+        self.save_txt_button.configure(state=state)
+        self.save_json_button.configure(state=state)
+
+    def _clear_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+    def _populate_contours(self, rows, total):
+        self._clear_tree()
+        for rank, entry in enumerate(rows, start=1):
+            self.tree.insert(
+                "",
+                tk.END,
+                values=(
+                    rank,
+                    f"{entry['length']:.1f}",
+                    f"{entry['area']:.1f}",
+                    entry["max_segments"],
+                ),
+            )
+        self.log(f"Showing top {len(rows)} of {total} usable contours.")
+
+    def save_png(self):
+        if not self.outputs:
+            messagebox.showwarning("Warning", "No result to save.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save PNG",
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self.outputs["result_image"].save(path)
+            self.log(f"Saved PNG: {path}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to save PNG.\n\n{exc}")
+
+    def save_txt(self):
+        if not self.outputs:
+            messagebox.showwarning("Warning", "No formula data to save.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save TXT",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+        )
+        if not path:
+            return
+        try:
+            text = build_formula_text(self.outputs["project_meta"], self.outputs["formula_data"])
+            with open(path, "w", encoding="utf-8") as file:
+                file.write(text)
+            self.log(f"Saved TXT: {path}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to save TXT.\n\n{exc}")
+
+    def save_json(self):
+        if not self.outputs:
+            messagebox.showwarning("Warning", "No formula data to save.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save JSON",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            obj = {
+                "project_meta": self.outputs["project_meta"],
+                "formula_data": self.outputs["formula_data"],
+                "zone_data": self.outputs.get("zone_data", []),
+            }
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(obj, file, ensure_ascii=False, indent=2)
+            self.log(f"Saved JSON: {path}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to save JSON.\n\n{exc}")
+
+
+if __name__ == "__main__":
+    app = ContourGraphArtApp()
+    app.mainloop()
