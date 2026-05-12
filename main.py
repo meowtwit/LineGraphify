@@ -15,6 +15,12 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
 
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
+SETTINGS_LOG_DIR = RESULTS_DIR / "setting_log"
+RESULTS_DIR.mkdir(exist_ok=True)
+SETTINGS_LOG_DIR.mkdir(exist_ok=True)
+
+
 EXPORT_FORMATS = {
     "auto": "自動",
     "json": "JSON（完全・大きめ）",
@@ -1600,11 +1606,24 @@ class ContourGraphArtApp(tk.Tk):
                 def cmd():
                     path = filedialog.asksaveasfilename(
                         title="PNG保存",
+                        initialdir=str(RESULTS_DIR),
                         defaultextension=".png",
                         filetypes=[("PNGファイル", "*.png")],
                     )
                     if path:
                         r["outputs"]["result_image"].save(path)
+                        s = r["settings"]
+                        log_path = SETTINGS_LOG_DIR / f"{Path(path).stem}.json"
+                        log = {
+                            "png_path": str(path),
+                            "loop_iteration": r["iteration"],
+                            "score": r["score"],
+                            "coverage": r["coverage"],
+                            "precision": r["precision"],
+                            "settings": asdict(s),
+                        }
+                        with open(log_path, "w", encoding="utf-8") as f:
+                            json.dump(log, f, ensure_ascii=False, indent=2)
                 return cmd
 
             ttk.Button(col, text="PNG保存", command=make_save_cmd()).pack(pady=(4, 0))
@@ -1735,6 +1754,7 @@ class ContourGraphArtApp(tk.Tk):
             return
         path = filedialog.asksaveasfilename(
             title="PNGを保存",
+            initialdir=str(RESULTS_DIR),
             defaultextension=".png",
             filetypes=[("PNGファイル", "*.png")],
         )
@@ -1742,9 +1762,26 @@ class ContourGraphArtApp(tk.Tk):
             return
         try:
             self.outputs["result_image"].save(path)
+            self._save_setting_log(path)
             self.log(f"PNGを保存しました: {path}")
         except Exception as exc:
             messagebox.showerror("エラー", f"PNG保存に失敗しました。\n\n{exc}")
+
+    def _save_setting_log(self, png_path):
+        png_stem = Path(png_path).stem
+        log_path = SETTINGS_LOG_DIR / f"{png_stem}.json"
+        meta = self.outputs.get("project_meta", {})
+        settings = meta.get("settings", {})
+        log = {
+            "png_path": str(png_path),
+            "source_image": meta.get("source_image_path"),
+            "total_formula_count": meta.get("total_formula_count"),
+            "processed_size": [meta.get("processed_width"), meta.get("processed_height")],
+            "settings": settings,
+        }
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+        self.log(f"設定ログを保存しました: {log_path}")
 
     def save_txt(self):
         if not self.outputs:
