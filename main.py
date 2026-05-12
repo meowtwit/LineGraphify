@@ -762,7 +762,7 @@ def build_segments_from_contours(contour_entries, settings):
                     break
                 pts = resample_open_polyline(pts, remaining + 1)
                 segment_count = len(pts) - 1
-            beziers = open_polyline_to_cubic_segments(pts)
+            beziers = catmull_rom_open_to_beziers(pts)
             if not beziers:
                 continue
             trial.append(
@@ -1101,6 +1101,71 @@ def process_image_to_formulas(img_rgb, image_path, settings, callback):
     }
 
 
+def evaluate_result_quality(result_image_pil, original_image_pil):
+    """エッジカバレッジと精度からスコアを計算。(score, coverage, precision) を返す。"""
+    orig_np = np.array(original_image_pil.convert("L"))
+    result_np = np.array(result_image_pil.convert("L"))
+
+    orig_edges = cv2.Canny(orig_np, 20, 60)
+    # result は白背景・黒線なので反転して「線ピクセル」を取る
+    result_lines = (result_np < 128).astype(np.uint8) * 255
+
+    # 比較のため result をリサイズ
+    if orig_edges.shape != result_lines.shape:
+        result_lines = cv2.resize(result_lines, (orig_edges.shape[1], orig_edges.shape[0]))
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dilated_edges = cv2.dilate(orig_edges, kernel)
+    dilated_lines = cv2.dilate(result_lines, kernel)
+
+    edge_px = orig_edges > 0
+    line_px = result_lines > 0
+    dilated_edge_px = dilated_edges > 0
+    dilated_line_px = dilated_lines > 0
+
+    coverage = float((edge_px & dilated_line_px).sum()) / max(edge_px.sum(), 1)
+    precision = float((line_px & dilated_edge_px).sum()) / max(line_px.sum(), 1)
+
+    if coverage + precision < 1e-6:
+        return 0.0, 0.0, 0.0
+    score = 2 * coverage * precision / (coverage + precision)
+    return score, coverage, precision
+
+
+def reflect_settings(settings, score, coverage, precision, loop_index):
+    """スコア・カバレッジ・精度をもとに次ループのパラメータを調整して返す。"""
+    from dataclasses import asdict
+    s = ProcessSettings(**asdict(settings))
+
+    if coverage < 0.45 and precision >= 0.5:
+        # 線が少ない → 検出を緩める
+        s.canny_lower = max(5, int(s.canny_lower * 0.8))
+        s.canny_upper = max(s.canny_lower + 20, int(s.canny_upper * 0.85))
+        s.min_contour_length = max(8.0, s.min_contour_length * 0.8)
+        s.max_total_formulas = min(1_000_000, int(s.max_total_formulas * 1.4))
+
+    elif precision < 0.45 and coverage >= 0.5:
+        # ノイズが多い → 検出を絞る
+        s.blur_amount = min(15, s.blur_amount + 2)
+        s.canny_lower = min(80, int(s.canny_lower * 1.2))
+        s.canny_upper = max(s.canny_lower + 20, int(s.canny_upper * 1.15))
+        s.min_contour_length = min(120.0, s.min_contour_length * 1.25)
+
+    elif coverage < 0.45 and precision < 0.45:
+        # 両方悪い → ぼかしを減らしつつ式数を増やす
+        s.blur_amount = max(1, s.blur_amount - 1)
+        s.canny_lower = max(5, int(s.canny_lower * 0.85))
+        s.min_contour_length = max(8.0, s.min_contour_length * 0.85)
+        s.max_total_formulas = min(1_000_000, int(s.max_total_formulas * 1.5))
+
+    else:
+        # スコアが良い → さらに精密化
+        s.max_total_formulas = min(1_000_000, int(s.max_total_formulas * 1.25))
+        s.approx_epsilon = max(0.1, s.approx_epsilon * 0.8)
+
+    return s
+
+
 class ContourGraphArtApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1114,6 +1179,9 @@ class ContourGraphArtApp(tk.Tk):
         self.outputs = None
         self.processing_thread = None
         self.queue = queue.Queue()
+
+        self.auto_loop_results = []
+        self.gallery_window = None
 
         self._build_ui()
         self.after(100, self._process_queue)
@@ -1136,6 +1204,7 @@ class ContourGraphArtApp(tk.Tk):
         self.file_label.pack(side=tk.LEFT, padx=12)
 
         self._build_settings()
+        self._build_auto_loop()
         self._build_previews()
         self._build_progress_and_logs()
 
@@ -1271,6 +1340,25 @@ class ContourGraphArtApp(tk.Tk):
         self.log_text.insert(tk.END, "準備完了。\n")
         self.log_text.configure(state=tk.DISABLED)
 
+    def _build_auto_loop(self):
+        frame = ttk.LabelFrame(self, text="自動ループ", padding=8)
+        frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        self.auto_loop_count_var = tk.IntVar(value=5)
+        ttk.Label(frame, text="ループ回数").grid(row=0, column=0, sticky="w", padx=4)
+        ttk.Entry(frame, textvariable=self.auto_loop_count_var, width=6).grid(row=0, column=1, sticky="w", padx=4)
+
+        self.auto_loop_button = ttk.Button(frame, text="自動ループ開始", command=self.start_auto_loop)
+        self.auto_loop_button.grid(row=0, column=2, padx=8)
+
+        self.gallery_button = ttk.Button(frame, text="結果ギャラリーを表示", command=self.show_gallery, state=tk.DISABLED)
+        self.gallery_button.grid(row=0, column=3, padx=4)
+
+        self.auto_loop_status_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.auto_loop_status_var, foreground="blue").grid(
+            row=0, column=4, sticky="w", padx=12
+        )
+
     def log(self, text):
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, text + "\n")
@@ -1389,6 +1477,142 @@ class ContourGraphArtApp(tk.Tk):
         except Exception as exc:
             self.queue.put({"type": "error", "text": str(exc)})
 
+    def start_auto_loop(self):
+        if self.original_image_np is None:
+            messagebox.showwarning("警告", "先に画像を読み込んでください。")
+            return
+        if self.processing_thread is not None and self.processing_thread.is_alive():
+            messagebox.showinfo("情報", "すでに処理中です。")
+            return
+        try:
+            settings = self._read_settings()
+            loop_count = max(1, int(self.auto_loop_count_var.get()))
+        except Exception as exc:
+            messagebox.showerror("エラー", f"パラメータが不正です。\n\n{exc}")
+            return
+
+        self.auto_loop_results = []
+        self.auto_loop_button.configure(state=tk.DISABLED)
+        self.run_button.configure(state=tk.DISABLED)
+        self.gallery_button.configure(state=tk.DISABLED)
+        self._set_save_state(tk.DISABLED)
+        self.auto_loop_status_var.set(f"ループ 0/{loop_count} 実行中...")
+        self.log(f"自動ループ開始: {loop_count} 回")
+
+        self.processing_thread = threading.Thread(
+            target=self._worker_auto_loop,
+            args=(settings, loop_count),
+            daemon=True,
+        )
+        self.processing_thread.start()
+
+    def _worker_auto_loop(self, initial_settings, loop_count):
+        settings = initial_settings
+        for i in range(loop_count):
+            self.queue.put({"type": "auto_loop_iter", "iteration": i + 1, "total": loop_count})
+            try:
+                outputs = process_image_to_formulas(
+                    self.original_image_np.copy(),
+                    self.original_image_path,
+                    settings,
+                    self.queue.put,
+                )
+            except Exception as exc:
+                self.queue.put({"type": "log", "text": f"ループ {i+1} エラー: {exc}"})
+                break
+
+            score, coverage, precision = evaluate_result_quality(
+                outputs["result_image"],
+                outputs["processed_image"],
+            )
+            self.auto_loop_results.append({
+                "iteration": i + 1,
+                "settings": settings,
+                "outputs": outputs,
+                "score": score,
+                "coverage": coverage,
+                "precision": precision,
+            })
+            self.queue.put({
+                "type": "auto_loop_result",
+                "iteration": i + 1,
+                "total": loop_count,
+                "outputs": outputs,
+                "score": score,
+                "coverage": coverage,
+                "precision": precision,
+            })
+
+            if i < loop_count - 1:
+                settings = reflect_settings(settings, score, coverage, precision, i)
+
+        self.queue.put({"type": "auto_loop_done", "total": loop_count})
+
+    def show_gallery(self):
+        if not self.auto_loop_results:
+            messagebox.showinfo("情報", "ループ結果がありません。")
+            return
+
+        if self.gallery_window and self.gallery_window.winfo_exists():
+            self.gallery_window.lift()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("自動ループ ギャラリー")
+        self.gallery_window = win
+
+        canvas = tk.Canvas(win)
+        scrollbar = ttk.Scrollbar(win, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        best_score = max(r["score"] for r in self.auto_loop_results)
+        thumb_size = (260, 260)
+
+        for result in self.auto_loop_results:
+            is_best = abs(result["score"] - best_score) < 1e-6
+            label_text = f"#{result['iteration']}  スコア: {result['score']:.3f}"
+            if is_best:
+                label_text += "  ★ベスト"
+            col = ttk.LabelFrame(inner, text=label_text, padding=6)
+            col.pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
+
+            img = result["outputs"]["result_image"]
+            photo = pil_to_tk_image(img, max_size=thumb_size)
+            img_label = ttk.Label(col, image=photo)
+            img_label.image = photo
+            img_label.pack()
+
+            s = result["settings"]
+            info = (
+                f"カバレッジ: {result['coverage']:.3f}  精度: {result['precision']:.3f}\n"
+                f"式数: {s.max_total_formulas}  Canny: {s.canny_lower}/{s.canny_upper}\n"
+                f"ぼかし: {s.blur_amount}  最小輪郭: {s.min_contour_length:.0f}\n"
+                f"近似強度: {s.approx_epsilon:.2f}"
+            )
+            ttk.Label(col, text=info, justify="left", font=("", 9)).pack(anchor="w", pady=(4, 0))
+
+            def make_save_cmd(r=result):
+                def cmd():
+                    path = filedialog.asksaveasfilename(
+                        title="PNG保存",
+                        defaultextension=".png",
+                        filetypes=[("PNGファイル", "*.png")],
+                    )
+                    if path:
+                        r["outputs"]["result_image"].save(path)
+                return cmd
+
+            ttk.Button(col, text="PNG保存", command=make_save_cmd()).pack(pady=(4, 0))
+
+        inner.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        win.geometry(f"{min(1400, len(self.auto_loop_results) * 290 + 40)}x520")
+
     def _process_queue(self):
         try:
             while True:
@@ -1418,9 +1642,40 @@ class ContourGraphArtApp(tk.Tk):
                     self.log(f"完了しました。総式数: {total}")
                 elif msg_type == "error":
                     self.run_button.configure(state=tk.NORMAL)
+                    self.auto_loop_button.configure(state=tk.NORMAL)
                     self.status_var.set("エラー")
                     self.log("エラー: " + msg["text"])
                     messagebox.showerror("処理エラー", msg["text"])
+                elif msg_type == "auto_loop_iter":
+                    i, total = msg["iteration"], msg["total"]
+                    self.auto_loop_status_var.set(f"ループ {i}/{total} 実行中...")
+                    self.status_var.set(f"自動ループ {i}/{total}")
+                    self.progress_var.set(0.0)
+                elif msg_type == "auto_loop_result":
+                    i, total = msg["iteration"], msg["total"]
+                    self._set_preview("result", msg["outputs"]["result_image"])
+                    self.log(
+                        f"ループ {i}/{total} 完了 — スコア: {msg['score']:.3f} "
+                        f"(カバレッジ: {msg['coverage']:.3f} / 精度: {msg['precision']:.3f})"
+                    )
+                elif msg_type == "auto_loop_done":
+                    total = msg["total"]
+                    self.run_button.configure(state=tk.NORMAL)
+                    self.auto_loop_button.configure(state=tk.NORMAL)
+                    self.gallery_button.configure(state=tk.NORMAL)
+                    self.progress_var.set(100.0)
+                    if self.auto_loop_results:
+                        best = max(self.auto_loop_results, key=lambda r: r["score"])
+                        self.outputs = best["outputs"]
+                        self._set_preview("processed", self.outputs["processed_image"])
+                        self._set_preview("edges", self.outputs["edge_image"])
+                        self._set_preview("result", self.outputs["result_image"])
+                        self._set_save_state(tk.NORMAL)
+                        self.update_size_estimate()
+                        self.auto_loop_status_var.set(
+                            f"完了 — ベスト: #{best['iteration']} スコア {best['score']:.3f}"
+                        )
+                        self.log(f"自動ループ完了。ベスト: #{best['iteration']} (スコア {best['score']:.3f})")
         except queue.Empty:
             pass
 
@@ -1451,9 +1706,8 @@ class ContourGraphArtApp(tk.Tk):
             self.outputs.get("zone_data", []),
             format_key,
         )
-        cleanup = "一時ファイル削除: ON" if self.auto_delete_temp_var.get() else "一時ファイル削除: OFF"
         self.size_estimate_var.set(
-            f"予想サイズ: 約 {format_bytes(estimated)} / 実形式: {EXPORT_FORMATS[actual_format]} / {cleanup}"
+            f"予想サイズ: 約 {format_bytes(estimated)} / 実形式: {EXPORT_FORMATS[actual_format]}"
         )
 
     def _clear_tree(self):
