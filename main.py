@@ -943,7 +943,7 @@ def format_poly_latex(coeffs, sig_figs=4):
     return "".join(parts) if parts else "0"
 
 
-def build_formula_latex(project_meta, formula_data, sig_figs=4):
+def build_formula_latex(project_meta, formula_data, sig_figs=4, txt_include_path=None):
     src = project_meta.get("source_image_path", "")
     w = project_meta.get("processed_width", "?")
     h = project_meta.get("processed_height", "?")
@@ -954,6 +954,7 @@ def build_formula_latex(project_meta, formula_data, sig_figs=4):
         r"\usepackage{amsmath}",
         r"\usepackage[margin=2cm]{geometry}",
         r"\usepackage{hyperref}",
+        r"\usepackage{verbatim}",
         r"\begin{document}",
         r"",
         r"\begin{center}",
@@ -986,12 +987,21 @@ def build_formula_latex(project_meta, formula_data, sig_figs=4):
             lines.append(rf"  y_{{{ci},{si}}}(t) &= {ypoly} \\[2pt]")
         lines.append(r"\end{align*}")
 
+    if txt_include_path:
+        rel = Path(txt_include_path).name
+        lines += [
+            r"",
+            r"\clearpage",
+            r"\section*{Appendix: Formula Details (TXT)}",
+            rf"\verbatiminput{{{rel}}}",
+        ]
+
     lines.append(r"\end{document}")
     return "\n".join(lines)
 
 
-def write_formula_latex(path, project_meta, formula_data, sig_figs=4):
-    content = build_formula_latex(project_meta, formula_data, sig_figs)
+def write_formula_latex(path, project_meta, formula_data, sig_figs=4, txt_include_path=None):
+    content = build_formula_latex(project_meta, formula_data, sig_figs, txt_include_path)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -2039,14 +2049,23 @@ class ContourGraphArtApp(tk.Tk):
         )
         if not path:
             return
+
+        txt_path = filedialog.askopenfilename(
+            title="インクルードする説明TXTを選択（不要ならキャンセル）",
+            initialdir=str(RESULTS_DIR),
+            filetypes=[("テキストファイル", "*.txt"), ("すべてのファイル", "*.*")],
+        )
+
         try:
             write_formula_latex(
                 path,
                 self.outputs["project_meta"],
                 self.outputs["formula_data"],
+                txt_include_path=txt_path or None,
             )
             total = self.outputs["project_meta"]["total_formula_count"]
-            self.log(f"LaTeX を保存しました: {path}  ({total} curves)")
+            note = f"  + {Path(txt_path).name}" if txt_path else ""
+            self.log(f"LaTeX を保存しました: {path}  ({total} curves){note}")
         except Exception as exc:
             messagebox.showerror("エラー", f"LaTeX 保存に失敗しました。\n\n{exc}")
 
