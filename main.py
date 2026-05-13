@@ -1329,6 +1329,52 @@ def random_settings(base_settings):
     return s
 
 
+def _parse_settings_file(path):
+    """setting_log JSON または 説明 TXT から設定辞書を返す。"""
+    path = Path(path)
+    if path.suffix.lower() == ".json":
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        # setting_log の {"settings": {...}} 形式
+        if "settings" in data:
+            return data["settings"]
+        # project_meta を直接保存した場合も同じキー
+        raise ValueError("JSON に 'settings' キーが見つかりません。")
+    else:
+        # 説明 TXT: "Settings:" 以降の "  key: value" 行を読む
+        result = {}
+        in_settings = False
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                stripped = line.rstrip()
+                if stripped.strip() == "Settings:":
+                    in_settings = True
+                    continue
+                if in_settings:
+                    if stripped == "" or (stripped and stripped[0] not in (" ", "\t")):
+                        break
+                    if ":" in stripped:
+                        key, _, val = stripped.strip().partition(": ")
+                        result[key.strip()] = val.strip()
+        if not result:
+            raise ValueError("TXT に Settings セクションが見つかりません。")
+        # 型変換: True/False 文字列・数値を適切に変換
+        for k, v in result.items():
+            if v.lower() == "true":
+                result[k] = True
+            elif v.lower() == "false":
+                result[k] = False
+            else:
+                try:
+                    result[k] = int(v)
+                except ValueError:
+                    try:
+                        result[k] = float(v)
+                    except ValueError:
+                        pass
+        return result
+
+
 class ContourGraphArtApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1354,6 +1400,7 @@ class ContourGraphArtApp(tk.Tk):
         top.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Button(top, text="画像読み込み", command=self.load_image).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="設定読み込み", command=self.load_settings).pack(side=tk.LEFT, padx=4)
         self.run_button = ttk.Button(top, text="処理開始", command=self.start_processing)
         self.run_button.pack(side=tk.LEFT, padx=4)
         self.save_png_button = ttk.Button(top, text="PNG保存", command=self.save_png, state=tk.DISABLED)
@@ -1533,6 +1580,53 @@ class ContourGraphArtApp(tk.Tk):
         self.log_text.insert(tk.END, text + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def load_settings(self):
+        path = filedialog.askopenfilename(
+            title="設定ファイルを選択（setting_log JSON または 説明 TXT）",
+            initialdir=str(RESULTS_DIR),
+            filetypes=[
+                ("設定ファイル", "*.json *.txt"),
+                ("JSON", "*.json"),
+                ("テキスト", "*.txt"),
+                ("すべて", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            settings = _parse_settings_file(path)
+            self._apply_settings(settings)
+            self.log(f"設定を読み込みました: {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("エラー", f"設定の読み込みに失敗しました。\n\n{exc}")
+
+    def _apply_settings(self, d):
+        def set_if(var, key, cast):
+            if key in d:
+                try:
+                    var.set(cast(d[key]))
+                except (ValueError, TypeError):
+                    pass
+
+        set_if(self.max_image_size_var,     "max_image_size",      int)
+        set_if(self.blur_amount_var,         "blur_amount",         int)
+        set_if(self.canny_lower_var,         "canny_lower",         int)
+        set_if(self.canny_upper_var,         "canny_upper",         int)
+        set_if(self.morphology_kernel_var,   "morphology_kernel",   int)
+        set_if(self.min_contour_length_var,  "min_contour_length",  float)
+        set_if(self.min_contour_area_var,    "min_contour_area",    float)
+        set_if(self.approx_epsilon_var,      "approx_epsilon",      float)
+        set_if(self.max_total_formulas_var,  "max_total_formulas",  int)
+        set_if(self.samples_per_segment_var, "samples_per_segment", int)
+        set_if(self.line_width_var,          "line_width",          int)
+        set_if(self.fill_close_kernel_var,   "fill_close_kernel",   int)
+        set_if(self.fill_boundary_width_var, "fill_boundary_width", int)
+        set_if(self.x_half_range_var,        "x_half_range",        float)
+        set_if(self.invert_lines_var,        "invert_lines",        lambda v: str(v).lower() in ("true", "1"))
+        set_if(self.overlay_var,             "overlay",             lambda v: str(v).lower() in ("true", "1"))
+        set_if(self.fill_zones_var,          "fill_zones",          lambda v: str(v).lower() in ("true", "1"))
+        set_if(self.major_only_var,          "major_only",          lambda v: str(v).lower() in ("true", "1"))
 
     def load_image(self):
         path = filedialog.askopenfilename(
