@@ -1375,6 +1375,93 @@ def _parse_settings_file(path):
         return result
 
 
+# ── Video processing ─────────────────────────────────────────────────────────
+
+def _video_frame_count(video_path):
+    cap = cv2.VideoCapture(str(video_path))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps   = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+    w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return total, fps, w, h
+
+
+def process_video_to_video(video_path, output_path, settings,
+                           stride, output_fps, callback):
+    """
+    動画 → フレーム毎に関数近似 → 動画に戻す。
+    stride  : 何フレームおきに処理するか（1=全フレーム, 2=隔フレーム, …）
+    output_fps: 0 のとき元動画と同じ fps を使う
+    callback: queue.put 相当。{"type": "video_progress", ...} を送る
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"動画を開けません: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    src_fps      = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+    src_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_fps      = output_fps if output_fps > 0 else src_fps
+
+    # 出力サイズは settings.max_image_size に合わせてリサイズ後の最初の結果に合わせる
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = None          # 最初のフレーム処理後に初期化
+    start_time = time.time()
+
+    processed_count = 0
+    frame_num = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_num % stride == 0:
+            # 進捗報告
+            pct = min(99, int(frame_num / max(total_frames, 1) * 100))
+            elapsed = time.time() - start_time
+            eta = elapsed * (100 - pct) / pct if pct > 0 else None
+            callback({
+                "type": "video_progress",
+                "frame": frame_num,
+                "total": total_frames,
+                "value": pct,
+                "eta": eta,
+                "status": f"動画フレーム {frame_num + 1}/{total_frames} 処理中...",
+            })
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            try:
+                outputs = process_image_to_formulas(
+                    frame_rgb, str(video_path), settings, lambda _: None
+                )
+                result_pil = outputs["result_image"]
+
+                # ライター初期化（最初のフレームのサイズが確定してから）
+                out_w, out_h = result_pil.size
+                if writer is None:
+                    writer = cv2.VideoWriter(
+                        str(output_path), fourcc, out_fps, (out_w, out_h)
+                    )
+
+                result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+                writer.write(result_bgr)
+                processed_count += 1
+
+            except Exception as exc:
+                callback({"type": "log", "text": f"フレーム {frame_num} エラー: {exc}"})
+
+        frame_num += 1
+
+    cap.release()
+    if writer is not None:
+        writer.release()
+
+    return processed_count, src_fps
+
+
 class ContourGraphArtApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1391,6 +1478,9 @@ class ContourGraphArtApp(tk.Tk):
 
         self.auto_loop_results = []
         self.gallery_window = None
+
+        self.video_src_path = None   # 入力動画パス
+        self.video_thread   = None   # 動画処理スレッド
 
         self._build_ui()
         self.after(100, self._process_queue)
@@ -1417,6 +1507,7 @@ class ContourGraphArtApp(tk.Tk):
 
         self._build_settings()
         self._build_auto_loop()
+        self._build_video_section()
         self._build_previews()
         self._build_progress_and_logs()
 
@@ -1574,6 +1665,155 @@ class ContourGraphArtApp(tk.Tk):
         ttk.Label(frame, textvariable=self.auto_loop_status_var, foreground="blue").grid(
             row=0, column=6, sticky="w", padx=12
         )
+
+    # ── 動画セクション ────────────────────────────────────────────────────────
+
+    def _build_video_section(self):
+        frame = ttk.LabelFrame(self, text="動画処理 (MP4 → 関数アート動画)", padding=8)
+        frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        # 入力動画ファイル名ラベル
+        self.video_name_var = tk.StringVar(value="動画未選択")
+        ttk.Button(frame, text="動画読み込み", command=self.load_video).grid(
+            row=0, column=0, padx=4, pady=4
+        )
+        ttk.Label(frame, textvariable=self.video_name_var, width=22, anchor="w").grid(
+            row=0, column=1, sticky="w", padx=4
+        )
+
+        # フレーム間隔
+        self.video_stride_var = tk.IntVar(value=1)
+        ttk.Label(frame, text="フレーム間隔").grid(row=0, column=2, sticky="w", padx=(16, 4))
+        ttk.Entry(frame, textvariable=self.video_stride_var, width=4).grid(
+            row=0, column=3, padx=4
+        )
+        ttk.Label(frame, text="(1=全, 2=隔, ...)").grid(row=0, column=4, sticky="w")
+
+        # 出力FPS
+        self.video_fps_var = tk.DoubleVar(value=0.0)
+        ttk.Label(frame, text="出力FPS").grid(row=0, column=5, sticky="w", padx=(16, 4))
+        ttk.Entry(frame, textvariable=self.video_fps_var, width=6).grid(
+            row=0, column=6, padx=4
+        )
+        ttk.Label(frame, text="(0=元と同じ)").grid(row=0, column=7, sticky="w")
+
+        # ボタン
+        self.video_run_button = ttk.Button(
+            frame, text="動画処理開始", command=self.start_video_processing, state=tk.DISABLED
+        )
+        self.video_run_button.grid(row=0, column=8, padx=(16, 4), pady=4)
+
+        self.video_stop_button = ttk.Button(
+            frame, text="中断", command=self.stop_video_processing, state=tk.DISABLED
+        )
+        self.video_stop_button.grid(row=0, column=9, padx=4)
+
+        # ステータス
+        self.video_status_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.video_status_var, foreground="blue").grid(
+            row=0, column=10, sticky="w", padx=12
+        )
+
+    def load_video(self):
+        path = filedialog.askopenfilename(
+            title="動画ファイルを選択",
+            filetypes=[
+                ("動画ファイル", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
+                ("すべてのファイル", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            total, fps, w, h = _video_frame_count(path)
+        except Exception as exc:
+            messagebox.showerror("エラー", f"動画情報の取得に失敗しました。\n\n{exc}")
+            return
+
+        self.video_src_path = path
+        self.video_name_var.set(os.path.basename(path))
+        self.video_run_button.configure(state=tk.NORMAL)
+        self.video_status_var.set("")
+        self.log(
+            f"動画読み込み: {os.path.basename(path)} "
+            f"({w}×{h}, {fps:.1f}fps, {total}フレーム)"
+        )
+
+    def start_video_processing(self):
+        if not self.video_src_path:
+            messagebox.showwarning("警告", "先に動画を読み込んでください。")
+            return
+        if self.video_thread is not None and self.video_thread.is_alive():
+            messagebox.showinfo("情報", "すでに処理中です。")
+            return
+
+        # 保存先を先に聞く
+        default_name = Path(self.video_src_path).stem + "_art.mp4"
+        output_path = filedialog.asksaveasfilename(
+            title="出力動画の保存先",
+            initialdir=str(RESULTS_DIR),
+            initialfile=default_name,
+            defaultextension=".mp4",
+            filetypes=[("MP4ファイル", "*.mp4"), ("すべてのファイル", "*.*")],
+        )
+        if not output_path:
+            return
+
+        try:
+            settings = self._read_settings()
+            stride   = max(1, int(self.video_stride_var.get()))
+            out_fps  = max(0.0, float(self.video_fps_var.get()))
+        except Exception as exc:
+            messagebox.showerror("エラー", f"パラメータが不正です。\n\n{exc}")
+            return
+
+        self._video_cancel = False
+        self.video_run_button.configure(state=tk.DISABLED)
+        self.video_stop_button.configure(state=tk.NORMAL)
+        self.run_button.configure(state=tk.DISABLED)
+        self.auto_loop_button.configure(state=tk.DISABLED)
+        self.progress_var.set(0)
+        self.status_var.set("動画処理中...")
+        self.video_status_var.set("処理中...")
+        self.log(f"動画処理開始 → {os.path.basename(output_path)}  stride={stride}")
+
+        self.video_thread = threading.Thread(
+            target=self._worker_video,
+            args=(settings, stride, out_fps, output_path),
+            daemon=True,
+        )
+        self.video_thread.start()
+
+    def stop_video_processing(self):
+        self._video_cancel = True
+        self.video_status_var.set("中断中...")
+        self.log("動画処理を中断します…")
+
+    def _worker_video(self, settings, stride, out_fps, output_path):
+        def cb(msg):
+            # 中断フラグが立ったら poison pill を投げて停止
+            if getattr(self, "_video_cancel", False):
+                raise InterruptedError("ユーザーが中断しました")
+            self.queue.put(msg)
+
+        try:
+            count, src_fps = process_video_to_video(
+                self.video_src_path, output_path,
+                settings, stride, out_fps, cb,
+            )
+            self.queue.put({
+                "type": "video_done",
+                "count": count,
+                "src_fps": src_fps,
+                "output_path": str(output_path),
+            })
+        except InterruptedError:
+            self.queue.put({"type": "video_cancelled"})
+        except Exception as exc:
+            self.queue.put({"type": "video_error", "text": str(exc)})
+
+    # ── ログ ──────────────────────────────────────────────────────────────────
 
     def log(self, text):
         self.log_text.configure(state=tk.NORMAL)
@@ -1933,6 +2173,32 @@ class ContourGraphArtApp(tk.Tk):
                     self.update_size_estimate()
                     total = self.outputs["project_meta"]["total_formula_count"]
                     self.log(f"完了しました。総式数: {total}")
+                elif msg_type == "video_progress":
+                    self.progress_var.set(msg["value"])
+                    self.status_var.set(msg["status"])
+                    self.eta_var.set(f"残り時間: {format_seconds(msg['eta'])}")
+                    done = msg["frame"] + 1
+                    tot  = msg["total"]
+                    self.video_status_var.set(f"{done}/{tot} フレーム")
+                elif msg_type == "video_done":
+                    self._video_done_ui()
+                    self.log(
+                        f"動画処理完了: {msg['count']} フレーム処理 "
+                        f"→ {os.path.basename(msg['output_path'])} "
+                        f"(元fps: {msg['src_fps']:.1f})"
+                    )
+                    self.video_status_var.set(
+                        f"完了 {msg['count']}フレーム → {os.path.basename(msg['output_path'])}"
+                    )
+                elif msg_type == "video_cancelled":
+                    self._video_done_ui()
+                    self.video_status_var.set("中断しました")
+                    self.log("動画処理を中断しました。")
+                elif msg_type == "video_error":
+                    self._video_done_ui()
+                    self.video_status_var.set("エラー")
+                    self.log("動画処理エラー: " + msg["text"])
+                    messagebox.showerror("動画処理エラー", msg["text"])
                 elif msg_type == "error":
                     self.run_button.configure(state=tk.NORMAL)
                     self.auto_loop_button.configure(state=tk.NORMAL)
@@ -1985,6 +2251,14 @@ class ContourGraphArtApp(tk.Tk):
         self.save_txt_button.configure(state=state)
         self.save_json_button.configure(state=state)
         self.save_latex_button.configure(state=state)
+
+    def _video_done_ui(self):
+        self.video_run_button.configure(state=tk.NORMAL)
+        self.video_stop_button.configure(state=tk.DISABLED)
+        self.run_button.configure(state=tk.NORMAL)
+        self.auto_loop_button.configure(state=tk.NORMAL)
+        self.progress_var.set(100.0)
+        self.status_var.set("待機中")
 
     def _selected_export_format(self):
         return EXPORT_FORMAT_BY_LABEL.get(self.export_format_var.get(), "auto")
