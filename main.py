@@ -4,6 +4,8 @@ import os
 import queue
 import csv
 import random
+import shutil
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -1387,13 +1389,61 @@ def _video_frame_count(video_path):
     return total, fps, w, h
 
 
+def _open_ffmpeg_writer(output_path, fps, w, h):
+    """
+    ffmpeg サブプロセスを開いて (proc, write_fn, close_fn) を返す。
+    write_fn(bgr_ndarray) でフレームを書き込み、close_fn() で終了。
+    ffmpeg が使えない場合は OpenCV VideoWriter にフォールバック。
+    """
+    output_path = Path(output_path)
+
+    if shutil.which("ffmpeg"):
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}",
+            "-r", str(fps),
+            "-i", "pipe:0",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "fast",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        def write_fn(bgr):
+            proc.stdin.write(bgr.tobytes())
+
+        def close_fn():
+            proc.stdin.close()
+            proc.wait()
+
+        return proc, write_fn, close_fn
+
+    # ffmpeg なし → OpenCV fallback（avc1 → mp4v → XVID の順で試す）
+    for codec, ext in [("avc1", ".mp4"), ("mp4v", ".mp4"), ("XVID", ".avi")]:
+        out = output_path.with_suffix(ext)
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(str(out), fourcc, fps, (w, h))
+        if writer.isOpened():
+            return writer, writer.write, writer.release
+        writer.release()
+
+    raise RuntimeError("動画ライターを開けませんでした（ffmpeg も OpenCV も失敗）")
+
+
 def process_video_to_video(video_path, output_path, settings,
                            stride, output_fps, callback):
     """
     動画 → フレーム毎に関数近似 → 動画に戻す。
-    stride  : 何フレームおきに処理するか（1=全フレーム, 2=隔フレーム, …）
-    output_fps: 0 のとき元動画と同じ fps を使う
-    callback: queue.put 相当。{"type": "video_progress", ...} を送る
+    stride    : 何フレームおきに処理するか（1=全, 2=隔, …）
+    output_fps: 0 のとき元動画と同じ fps
+    callback  : queue.put 相当
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1401,63 +1451,61 @@ def process_video_to_video(video_path, output_path, settings,
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     src_fps      = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
-    src_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out_fps      = output_fps if output_fps > 0 else src_fps
 
-    # 出力サイズは settings.max_image_size に合わせてリサイズ後の最初の結果に合わせる
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = None          # 最初のフレーム処理後に初期化
-    start_time = time.time()
-
+    writer_handle = None
+    write_fn      = None
+    close_fn      = None
+    start_time    = time.time()
     processed_count = 0
-    frame_num = 0
+    frame_num       = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        if frame_num % stride == 0:
-            # 進捗報告
-            pct = min(99, int(frame_num / max(total_frames, 1) * 100))
-            elapsed = time.time() - start_time
-            eta = elapsed * (100 - pct) / pct if pct > 0 else None
-            callback({
-                "type": "video_progress",
-                "frame": frame_num,
-                "total": total_frames,
-                "value": pct,
-                "eta": eta,
-                "status": f"動画フレーム {frame_num + 1}/{total_frames} 処理中...",
-            })
+            if frame_num % stride == 0:
+                pct = min(99, int(frame_num / max(total_frames, 1) * 100))
+                elapsed = time.time() - start_time
+                eta = elapsed * (100 - pct) / pct if pct > 0 else None
+                callback({
+                    "type": "video_progress",
+                    "frame": frame_num,
+                    "total": total_frames,
+                    "value": pct,
+                    "eta": eta,
+                    "status": f"動画フレーム {frame_num + 1}/{total_frames} 処理中...",
+                })
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            try:
-                outputs = process_image_to_formulas(
-                    frame_rgb, str(video_path), settings, lambda _: None
-                )
-                result_pil = outputs["result_image"]
-
-                # ライター初期化（最初のフレームのサイズが確定してから）
-                out_w, out_h = result_pil.size
-                if writer is None:
-                    writer = cv2.VideoWriter(
-                        str(output_path), fourcc, out_fps, (out_w, out_h)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                try:
+                    outputs = process_image_to_formulas(
+                        frame_rgb, str(video_path), settings, lambda _: None
                     )
+                    result_pil = outputs["result_image"]
+                    out_w, out_h = result_pil.size
 
-                result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
-                writer.write(result_bgr)
-                processed_count += 1
+                    # 最初のフレームでライター初期化
+                    if write_fn is None:
+                        writer_handle, write_fn, close_fn = _open_ffmpeg_writer(
+                            output_path, out_fps, out_w, out_h
+                        )
 
-            except Exception as exc:
-                callback({"type": "log", "text": f"フレーム {frame_num} エラー: {exc}"})
+                    result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+                    write_fn(result_bgr)
+                    processed_count += 1
 
-        frame_num += 1
+                except Exception as exc:
+                    callback({"type": "log", "text": f"フレーム {frame_num} エラー: {exc}"})
 
-    cap.release()
-    if writer is not None:
-        writer.release()
+            frame_num += 1
+
+    finally:
+        cap.release()
+        if close_fn is not None:
+            close_fn()
 
     return processed_count, src_fps
 
