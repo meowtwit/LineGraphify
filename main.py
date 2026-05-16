@@ -1391,13 +1391,19 @@ def _video_frame_count(video_path):
 
 def _open_ffmpeg_writer(output_path, fps, w, h):
     """
-    ffmpeg サブプロセスを開いて (proc, write_fn, close_fn) を返す。
-    write_fn(bgr_ndarray) でフレームを書き込み、close_fn() で終了。
+    ffmpeg サブプロセスを開いて (write_fn, close_fn) を返す。
+    write_fn(bgr_ndarray) でフレームを書き込む。
+    close_fn() で終了し、ffmpeg のエラーメッセージ文字列を返す。
     ffmpeg が使えない場合は OpenCV VideoWriter にフォールバック。
     """
+    import tempfile
     output_path = Path(output_path)
 
     if shutil.which("ffmpeg"):
+        # stderr をテンプファイルに保存 → エラー時にユーザーへ表示できる
+        fd, err_path = tempfile.mkstemp(suffix="_ffmpeg.log")
+        os.close(fd)
+
         cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -1411,19 +1417,30 @@ def _open_ffmpeg_writer(output_path, fps, w, h):
             "-movflags", "+faststart",
             str(output_path),
         ]
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        with open(err_path, "w") as ef:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=ef,
+            )
 
         def write_fn(bgr):
             proc.stdin.write(bgr.tobytes())
 
         def close_fn():
-            proc.stdin.close()
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
             proc.wait()
+            try:
+                with open(err_path, encoding="utf-8", errors="replace") as f:
+                    err_text = f.read()
+                os.unlink(err_path)
+            except Exception:
+                err_text = ""
+            return err_text  # 呼び出し元がログに出せるよう返す
 
-        return proc, write_fn, close_fn
+        return write_fn, close_fn
 
     # ffmpeg なし → OpenCV fallback（avc1 → mp4v → XVID の順で試す）
     for codec, ext in [("avc1", ".mp4"), ("mp4v", ".mp4"), ("XVID", ".avi")]:
@@ -1431,7 +1448,14 @@ def _open_ffmpeg_writer(output_path, fps, w, h):
         fourcc = cv2.VideoWriter_fourcc(*codec)
         writer = cv2.VideoWriter(str(out), fourcc, fps, (w, h))
         if writer.isOpened():
-            return writer, writer.write, writer.release
+            def write_fn(bgr, _w=writer):
+                _w.write(bgr)
+
+            def close_fn(_w=writer):
+                _w.release()
+                return ""
+
+            return write_fn, close_fn
         writer.release()
 
     raise RuntimeError("動画ライターを開けませんでした（ffmpeg も OpenCV も失敗）")
@@ -1453,10 +1477,9 @@ def process_video_to_video(video_path, output_path, settings,
     src_fps      = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     out_fps      = output_fps if output_fps > 0 else src_fps
 
-    writer_handle = None
-    write_fn      = None
-    close_fn      = None
-    start_time    = time.time()
+    write_fn        = None
+    close_fn        = None
+    start_time      = time.time()
     processed_count = 0
     frame_num       = 0
 
@@ -1484,28 +1507,47 @@ def process_video_to_video(video_path, output_path, settings,
                     outputs = process_image_to_formulas(
                         frame_rgb, str(video_path), settings, lambda _: None
                     )
-                    result_pil = outputs["result_image"]
-                    out_w, out_h = result_pil.size
+                except Exception as exc:
+                    callback({"type": "log", "text": f"フレーム {frame_num} 近似エラー: {exc}"})
+                    frame_num += 1
+                    continue
 
-                    # 最初のフレームでライター初期化
-                    if write_fn is None:
-                        writer_handle, write_fn, close_fn = _open_ffmpeg_writer(
-                            output_path, out_fps, out_w, out_h
-                        )
+                result_pil = outputs["result_image"]
+                out_w, out_h = result_pil.size
 
-                    result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+                # 最初のフレームでライター初期化
+                if write_fn is None:
+                    write_fn, close_fn = _open_ffmpeg_writer(
+                        output_path, out_fps, out_w, out_h
+                    )
+
+                result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+                try:
                     write_fn(result_bgr)
                     processed_count += 1
-
-                except Exception as exc:
-                    callback({"type": "log", "text": f"フレーム {frame_num} エラー: {exc}"})
+                except BrokenPipeError:
+                    # ffmpeg が終了した → stderr を読んでエラーを上げる
+                    err_text = ""
+                    if close_fn:
+                        try:
+                            err_text = close_fn()
+                        except Exception:
+                            pass
+                        close_fn = None
+                    raise RuntimeError(
+                        f"ffmpeg が予期せず終了しました。\n"
+                        f"ffmpegログ:\n{err_text[-800:] if err_text else '(取得できません)'}"
+                    )
 
             frame_num += 1
 
     finally:
         cap.release()
         if close_fn is not None:
-            close_fn()
+            err_text = close_fn()
+            # 正常終了時も ffmpeg がエラーを出していたらログへ
+            if err_text and "error" in err_text.lower():
+                callback({"type": "log", "text": f"ffmpeg警告: {err_text[-400:]}"})
 
     return processed_count, src_fps
 
