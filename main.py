@@ -1404,6 +1404,8 @@ def _open_ffmpeg_writer(output_path, fps, w, h):
         fd, err_path = tempfile.mkstemp(suffix="_ffmpeg.log")
         os.close(fd)
 
+        # libx264 は奇数サイズを受け付けないので pad で偶数に揃える
+        pad_filter = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
         cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -1411,6 +1413,7 @@ def _open_ffmpeg_writer(output_path, fps, w, h):
             "-s", f"{w}x{h}",
             "-r", str(fps),
             "-i", "pipe:0",
+            "-vf", pad_filter,
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "fast",
@@ -1521,8 +1524,8 @@ def process_video_to_video(video_path, output_path, settings,
                         output_path, out_fps, out_w, out_h
                     )
 
-                result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
                 try:
+                    result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
                     write_fn(result_bgr)
                     processed_count += 1
                 except BrokenPipeError:
@@ -1538,6 +1541,8 @@ def process_video_to_video(video_path, output_path, settings,
                         f"ffmpeg が予期せず終了しました。\n"
                         f"ffmpegログ:\n{err_text[-800:] if err_text else '(取得できません)'}"
                     )
+                except Exception as exc:
+                    callback({"type": "log", "text": f"フレーム {frame_num} 書き込みエラー: {exc}"})
 
             frame_num += 1
 
