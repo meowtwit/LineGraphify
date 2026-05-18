@@ -1008,6 +1008,140 @@ def write_formula_latex(path, project_meta, formula_data, sig_figs=4, txt_includ
         f.write(content)
 
 
+def _fmt_complex_coef(real, imag, sig_figs=4):
+    """複素数係数 a+bi を LaTeX 文字列に変換。ゼロに近い部分は省略。"""
+    threshold = 10 ** (-(sig_figs + 1))
+    has_r = abs(real) >= threshold
+    has_i = abs(imag) >= threshold
+    if not has_r and not has_i:
+        return None
+    if has_r and not has_i:
+        return _fmt_num(real, sig_figs)
+    if not has_r and has_i:
+        sign = "-" if imag < 0 else ""
+        return rf"{sign}{_fmt_num(abs(imag), sig_figs)}i"
+    sign = "-" if imag < 0 else "+"
+    return rf"({_fmt_num(real, sig_figs)} {sign} {_fmt_num(abs(imag), sig_figs)}i)"
+
+
+def _complex_term_latex(real, imag, power, is_first, sig_figs=4):
+    """複素係数 × t^power の一項を返す。ゼロ項は None。"""
+    coef_str = _fmt_complex_coef(real, imag, sig_figs)
+    if coef_str is None:
+        return None
+    var = {3: "t^{3}", 2: "t^{2}", 1: "t", 0: ""}.get(power, f"t^{{{power}}}")
+    # 純実数で±1のとき係数省略（変数項あるときのみ）
+    threshold = 10 ** (-(sig_figs + 1))
+    if power > 0 and abs(imag) < threshold and abs(abs(real) - 1.0) < threshold:
+        term = f"-{var}" if real < 0 else var
+    elif var:
+        term = rf"{coef_str}\,{var}"
+    else:
+        term = coef_str
+
+    if is_first:
+        return term
+    # 先頭以外は + で接続（符号は coef_str に含まれる）
+    return rf" + {term}" if not term.startswith("-") else rf" {term}"
+
+
+def format_complex_poly_latex(x_coeffs, y_coeffs, sig_figs=4):
+    """x係数列とy係数列から z(t) = Σ cₖtᵏ の LaTeX 文字列を返す。"""
+    terms = list(zip(x_coeffs, y_coeffs, [3, 2, 1, 0]))
+    parts = []
+    for real, imag, power in terms:
+        part = _complex_term_latex(real, imag, power, not parts, sig_figs)
+        if part is not None:
+            parts.append(part)
+    return "".join(parts) if parts else "0"
+
+
+def build_complex_latex(project_meta, formula_data, sig_figs=4):
+    """複素数平面表記の LaTeX ドキュメントを生成する。"""
+    src = project_meta.get("source_image_path", "")
+    w = project_meta.get("processed_width", "?")
+    h = project_meta.get("processed_height", "?")
+    total = project_meta.get("total_formula_count", "?")
+
+    lines = [
+        r"\documentclass{article}",
+        r"\usepackage{amsmath}",
+        r"\usepackage[margin=2cm]{geometry}",
+        r"\usepackage{hyperref}",
+        r"\begin{document}",
+        r"",
+        r"\begin{center}",
+        r"  {\Large\bfseries Contour Graph Art --- Complex Plane Representation}\\[6pt]",
+        rf"  \texttt{{{src}}}\\[2pt]",
+        rf"  {w}\,$\times$\,{h}\,px \quad Total curves: {total}",
+        r"\end{center}",
+        r"",
+        r"\bigskip",
+        (r"All curves are expressed as complex-valued cubic polynomials "
+         r"$z(t) = c_3 t^3 + c_2 t^2 + c_1 t + c_0$, $\;c_k \in \mathbb{C}$, "
+         r"with domain $0 \le t \le 1$.\\"),
+        r"The real axis $\operatorname{Re}(z)$ is horizontal (rightward positive); "
+        r"the imaginary axis $\operatorname{Im}(z)$ is vertical (upward positive).",
+        r"",
+    ]
+
+    for contour in formula_data:
+        ci = contour["contour_index"]
+        length = contour["source_length_px"]
+        n_seg = contour["allocated_formula_count"]
+        lines.append(r"\bigskip")
+        lines.append(
+            rf"\noindent\textbf{{Contour {ci}}} "
+            rf"\quad length ${length:.1f}$\,px \quad {n_seg} segment(s)\\"
+        )
+        lines.append(r"\begin{align*}")
+        for seg in contour["segments"]:
+            si = seg["segment_index"]
+            zpoly = format_complex_poly_latex(
+                seg["x_coefficients"], seg["y_coefficients"], sig_figs
+            )
+            lines.append(rf"  z_{{{ci},{si}}}(t) &= {zpoly} \\[2pt]")
+        lines.append(r"\end{align*}")
+
+    lines.append(r"\end{document}")
+    return "\n".join(lines)
+
+
+def write_complex_latex(path, project_meta, formula_data, sig_figs=4):
+    content = build_complex_latex(project_meta, formula_data, sig_figs)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def save_complex_plane_png(output_path, result_image, x_half_range):
+    """result_image（PIL）を複素数平面ラベル付きの PNG として保存する。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
+    img_arr = np.array(result_image)
+    h, w = img_arr.shape[:2]
+    y_half = x_half_range * h / w
+
+    fig, ax = plt.subplots(figsize=(w / 100, h / 100), dpi=100)
+    ax.imshow(img_arr, extent=[-x_half_range, x_half_range, -y_half, y_half],
+              origin="upper", aspect="equal")
+
+    ax.set_xlabel(r"$\operatorname{Re}(z)$", fontsize=13)
+    ax.set_ylabel(r"$\operatorname{Im}(z)$", fontsize=13)
+    ax.axhline(0, color="gray", linewidth=0.5, alpha=0.6)
+    ax.axvline(0, color="gray", linewidth=0.5, alpha=0.6)
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(2))
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(2))
+    ax.tick_params(labelsize=9)
+    ax.set_title("Complex Plane — Contour Graph Art", fontsize=11, pad=8)
+
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def count_formula_segments(formula_data):
     return sum(len(contour.get("segments", [])) for contour in formula_data or [])
 
@@ -1596,6 +1730,8 @@ class ContourGraphArtApp(tk.Tk):
         self.save_json_button.pack(side=tk.LEFT, padx=4)
         self.save_latex_button = ttk.Button(top, text="LaTeX書き出し", command=self.save_latex, state=tk.DISABLED)
         self.save_latex_button.pack(side=tk.LEFT, padx=4)
+        self.save_complex_button = ttk.Button(top, text="複素数平面", command=self.save_complex, state=tk.DISABLED)
+        self.save_complex_button.pack(side=tk.LEFT, padx=4)
 
         self.file_label = ttk.Label(top, text="画像未読み込み")
         self.file_label.pack(side=tk.LEFT, padx=12)
@@ -2346,6 +2482,7 @@ class ContourGraphArtApp(tk.Tk):
         self.save_txt_button.configure(state=state)
         self.save_json_button.configure(state=state)
         self.save_latex_button.configure(state=state)
+        self.save_complex_button.configure(state=state)
 
     def _video_done_ui(self):
         self.video_run_button.configure(state=tk.NORMAL)
@@ -2531,6 +2668,53 @@ class ContourGraphArtApp(tk.Tk):
             self.log(f"LaTeX を保存しました: {path}  ({total} curves){note}")
         except Exception as exc:
             messagebox.showerror("エラー", f"LaTeX 保存に失敗しました。\n\n{exc}")
+
+    def save_complex(self):
+        if not self.outputs:
+            messagebox.showwarning("警告", "保存する数式データがありません。")
+            return
+
+        choice = messagebox.askquestion(
+            "複素数平面 出力形式",
+            "LaTeX（.tex）として保存しますか？\n\n"
+            "「いいえ」を選ぶと複素数平面ラベル付き PNG を保存します。",
+            icon="question",
+        )
+
+        if choice == "yes":
+            path = filedialog.asksaveasfilename(
+                title="複素数平面 LaTeX を保存",
+                initialdir=str(RESULTS_DIR),
+                defaultextension=".tex",
+                filetypes=[("LaTeX ファイル", "*.tex"), ("すべてのファイル", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                write_complex_latex(
+                    path,
+                    self.outputs["project_meta"],
+                    self.outputs["formula_data"],
+                )
+                total = self.outputs["project_meta"]["total_formula_count"]
+                self.log(f"複素数平面 LaTeX を保存しました: {path}  ({total} curves)")
+            except Exception as exc:
+                messagebox.showerror("エラー", f"複素数 LaTeX 保存に失敗しました。\n\n{exc}")
+        else:
+            path = filedialog.asksaveasfilename(
+                title="複素数平面 PNG を保存",
+                initialdir=str(RESULTS_DIR),
+                defaultextension=".png",
+                filetypes=[("PNG 画像", "*.png"), ("すべてのファイル", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                x_half = self.outputs["project_meta"]["settings"].get("x_half_range", 10.0)
+                save_complex_plane_png(path, self.outputs["result_image"], x_half)
+                self.log(f"複素数平面 PNG を保存しました: {path}")
+            except Exception as exc:
+                messagebox.showerror("エラー", f"複素数平面 PNG 保存に失敗しました。\n\n{exc}")
 
 
 if __name__ == "__main__":
