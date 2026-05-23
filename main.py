@@ -37,6 +37,8 @@ EXPORT_FORMAT_BY_LABEL = {label: key for key, label in EXPORT_FORMATS.items()}
 
 try:
     import cv2
+    if cv2.ocl.haveOpenCL():
+        cv2.ocl.setUseOpenCL(True)
 except ImportError as exc:
     raise ImportError(
         "opencv-python が必要です。次を実行してください:\n"
