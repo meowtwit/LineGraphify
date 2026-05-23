@@ -1600,6 +1600,72 @@ def _open_ffmpeg_writer(output_path, fps, w, h):
     raise RuntimeError("動画ライターを開けませんでした（ffmpeg も OpenCV も失敗）")
 
 
+def _input_has_audio(video_path):
+    """入力動画に音声ストリームがあるか確認する。"""
+    vp = str(video_path)
+    try:
+        if shutil.which("ffprobe"):
+            r = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_streams",
+                 "-select_streams", "a", "-print_format", "compact", vp],
+                capture_output=True, timeout=10,
+            )
+            return bool(r.stdout.strip())
+        elif shutil.which("ffmpeg"):
+            r = subprocess.run(
+                ["ffmpeg", "-v", "quiet", "-i", vp],
+                capture_output=True, timeout=10,
+            )
+            stderr = r.stderr.decode("utf-8", errors="replace")
+            return "Audio:" in stderr
+    except Exception:
+        pass
+    return False
+
+
+def _mux_audio(video_path, audio_source_path, callback=None):
+    """video_path の動画に audio_source_path の音声を付けてファイルを上書きする。
+    音声がなければ何もしない。タイミングは -shortest で動画長に合わせる。"""
+    if not shutil.which("ffmpeg"):
+        return
+    if not _input_has_audio(audio_source_path):
+        return
+
+    video_path = Path(video_path)
+    tmp = video_path.with_suffix("._mux_tmp.mp4")
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-i", str(audio_source_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            str(tmp),
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=600)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > video_path.stat().st_size * 0.9:
+            video_path.unlink()
+            tmp.rename(video_path)
+            if callback:
+                callback({"type": "log", "text": "音声を付加しました。"})
+        else:
+            err = r.stderr.decode("utf-8", errors="replace")[-300:]
+            if callback:
+                callback({"type": "log", "text": f"音声付加スキップ（ストリームなしまたはエラー）: {err}"})
+            tmp.unlink(missing_ok=True)
+    except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if callback:
+            callback({"type": "log", "text": f"音声付加中にエラー: {exc}"})
+
+
 def process_video_to_video(video_path, output_path, settings,
                            stride, output_fps, callback):
     """
@@ -1686,9 +1752,13 @@ def process_video_to_video(video_path, output_path, settings,
         cap.release()
         if close_fn is not None:
             err_text = close_fn()
-            # 正常終了時も ffmpeg がエラーを出していたらログへ
             if err_text and "error" in err_text.lower():
                 callback({"type": "log", "text": f"ffmpeg警告: {err_text[-400:]}"})
+
+    # 入力に音声があれば出力にも付加する
+    if processed_count > 0:
+        callback({"type": "log", "text": "音声ストリームを確認中..."})
+        _mux_audio(output_path, video_path, callback)
 
     return processed_count, src_fps
 
